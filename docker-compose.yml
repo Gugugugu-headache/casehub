@@ -1,0 +1,63 @@
+version: "3.9"
+
+services:
+  case-db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpwd}
+      MYSQL_DATABASE: casehub
+      MYSQL_USER: casehub
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-casehubpwd}
+    volumes:
+      - case-db-data:/var/lib/mysql
+    ports:
+      - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpwd}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  case-minio:
+    image: minio/minio:RELEASE.2025-06-13T11-33-47Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - case-minio-data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  case-api:
+    build: ./backend
+    depends_on:
+      - case-db
+      - case-minio
+    environment:
+      DB_URL: mysql+asyncmy://casehub:${MYSQL_PASSWORD:-casehubpwd}@case-db:3306/casehub
+      MINIO_ENDPOINT: http://case-minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET_PENDING: pending
+      MINIO_BUCKET_KB: knowledge
+      RAGFLOW_BASE_URL: ${RAGFLOW_BASE_URL:-http://ragflow-server:8080}
+      RAGFLOW_API_KEY: ${RAGFLOW_API_KEY:-changeme}
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+    ports:
+      - "8000:8000"
+
+  case-web:
+    build: ./frontend
+    depends_on:
+      - case-api
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "8081:80"
+
+volumes:
+  case-db-data:
+  case-minio-data:

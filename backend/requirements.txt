@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+SQLAlchemy>=2.0
+asyncmy
+alembic
+httpx
+pydantic-settings
+python-multipart
+ragflow-sdk

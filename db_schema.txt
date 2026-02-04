@@ -1,0 +1,149 @@
+# Casehub 数据库表设计（拆分用户表）
+
+## 1. 管理员 / 教师 / 学生
+- admins
+  - id (bigint PK auto)
+  - admin_no (varchar(32) UNIQUE NOT NULL)
+  - username (varchar(64) UNIQUE NOT NULL)
+  - password_hash (varchar(255) NOT NULL)
+  - name (varchar(64))
+  - email (varchar(128) NULL)
+  - status (tinyint default 1)  -- 1正常 0停用
+  - created_at, updated_at
+
+- teachers
+  - id (bigint PK auto)
+  - teacher_no (varchar(32) UNIQUE NOT NULL)  -- 工号
+  - password_hash (varchar(255) NOT NULL)
+  - name (varchar(64) NOT NULL)
+  - email (varchar(128) NULL)
+  - status (tinyint default 1)
+  - created_at, updated_at
+
+- students
+  - id (bigint PK auto)
+  - student_no (varchar(32) UNIQUE NOT NULL)  -- 学号
+  - class_id (bigint FK -> classes.id NOT NULL)  -- 学生只能属于一个班级
+  - password_hash (varchar(255) NOT NULL)
+  - name (varchar(64) NOT NULL)
+  - email (varchar(128) NULL)
+  - status (tinyint default 1)
+  - created_at, updated_at
+
+## 2. 班级
+- classes
+  - id (bigint PK auto)
+  - class_code (varchar(32) UNIQUE NOT NULL)  -- 班级编号
+  - class_name (varchar(64) NOT NULL)
+  - teacher_id (bigint FK -> teachers.id NOT NULL) -- 一个班只对应一位教师，教师可管多班
+  - created_at, updated_at
+
+## 3. 知识库与文件
+- knowledge_bases
+  - id (bigint PK auto)
+  - class_id (bigint FK -> classes.id NOT NULL)  -- 一班一库，可 UNIQUE(class_id)
+  - name (varchar(128) NOT NULL)
+  - description (text NULL)
+  - ragflow_dataset_id (varchar(64) NOT NULL)
+  - created_at, updated_at
+
+- documents
+  - id (bigint PK auto)
+  - kb_id (bigint FK -> knowledge_bases.id NOT NULL)
+  - filename (varchar(255) NOT NULL)
+  - original_name (varchar(255) NOT NULL)
+  - uploader_student_id (bigint FK -> students.id NULL)  -- 上传者学生
+  - uploader_teacher_id (bigint FK -> teachers.id NULL)  -- 若教师上传
+  - uploader_admin_id (bigint FK -> admins.id NULL)      -- 若管理员上传
+  - size_bytes (bigint)
+  - mime_type (varchar(128))
+  - ragflow_document_id (varchar(64) NULL)
+  - status (enum: pending, approved, rejected, embedded) NOT NULL DEFAULT 'pending'
+  - storage_path (varchar(512))  -- 存储地址/对象key
+  - uploaded_at (datetime)
+  - updated_at (datetime)
+
+- document_audits
+  - id (bigint PK auto)
+  - document_id (bigint FK -> documents.id NOT NULL)
+  - reviewer_admin_id (bigint FK -> admins.id NOT NULL)
+  - decision (enum: approved, rejected) NOT NULL
+  - reason (varchar(255) NULL)
+  - decided_at (datetime NOT NULL)
+
+- document_versions (可选，需要版本/重命名记录时启用)
+  - id (bigint PK auto)
+  - document_id (bigint FK -> documents.id NOT NULL)
+  - version_no (int NOT NULL)
+  - filename (varchar(255) NOT NULL)
+  - storage_path (varchar(512) NOT NULL)
+  - created_at (datetime)
+
+## 4. 嵌入任务
+- embeddings_tasks
+  - id (bigint PK auto)
+  - document_id (bigint FK -> documents.id NOT NULL)
+  - triggered_by_teacher_id (bigint FK -> teachers.id NOT NULL)
+  - chunk_method (varchar(32) DEFAULT 'table')
+  - status (enum: queued, running, success, failed) DEFAULT 'queued'
+  - ragflow_task_id (varchar(64) NULL)
+  - started_at, finished_at (datetime NULL)
+  - message (text NULL)
+
+## 5. 对话与消息
+- conversations
+  - id (bigint PK auto)
+  - owner_teacher_id (bigint FK -> teachers.id NULL)
+  - owner_student_id (bigint FK -> students.id NULL)
+  - kb_id (bigint FK -> knowledge_bases.id NULL) -- 绑定的知识库
+  - model_name (varchar(64))
+  - top_n (int default 5)
+  - similarity_threshold (decimal(4,3) default 0.2)
+  - show_citations (boolean default true)
+  - system_prompt (text NULL)
+  - created_at, updated_at
+
+- messages
+  - id (bigint PK auto)
+  - conversation_id (bigint FK -> conversations.id NOT NULL)
+  - sender_role (enum: user, assistant, system) NOT NULL
+  - content (longtext NOT NULL)
+  - reference (json NULL) -- ragflow 返回的引文
+  - created_at (datetime)
+
+## 6. 搜索日志
+- search_logs
+  - id (bigint PK auto)
+  - user_teacher_id (bigint FK -> teachers.id NULL)
+  - user_student_id (bigint FK -> students.id NULL)
+  - kb_id (bigint FK -> knowledge_bases.id NOT NULL)
+  - query (varchar(512) NOT NULL)
+  - result_count (int)
+  - created_at (datetime)
+
+## 7. RAGFlow 配置
+- ragflow_settings
+  - id (bigint PK auto)
+  - owner_teacher_id (bigint FK -> teachers.id NULL)
+  - owner_student_id (bigint FK -> students.id NULL)
+  - api_base (varchar(255) DEFAULT 'http://localhost:8080')
+  - api_key (varchar(255) NOT NULL)
+  - default_model (varchar(64) NULL)
+  - created_at, updated_at
+
+## 约束与索引
+- classes.teacher_id -> teachers.id (INDEX teacher_id)
+- students.class_id -> classes.id (INDEX class_id)
+- knowledge_bases UNIQUE(class_id)
+- documents INDEX(kb_id, filename), INDEX(status), UNIQUE(ragflow_document_id)
+- document_audits INDEX(document_id)
+- embeddings_tasks INDEX(document_id), INDEX(status)
+- conversations INDEX(owner_teacher_id), INDEX(owner_student_id), INDEX(kb_id)
+- messages INDEX(conversation_id)
+- search_logs INDEX(user_teacher_id), INDEX(user_student_id), INDEX(kb_id, created_at)
+
+## 备注
+- 登录时需区分三表：可约定“账号前缀”或统一登录入口按工号/学号/用户名匹配对应表。
+- 上传者外键允许教师或学生，保持两个可空列；业务层确保二选一。
+- 学号/工号 NOT NULL + UNIQUE，保障非空约束。
+- 上传默认状态建议：学生上传设为 `pending` 待管理员审核；教师/管理员上传可直接设为 `approved`（免审核）。
