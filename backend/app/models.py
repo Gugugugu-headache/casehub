@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+"""CaseHub 的 SQLAlchemy ORM 模型。
+
+用于定义数据库表结构、关系与枚举类型。
+"""
+
 import enum
 from datetime import datetime
 from typing import Optional, List
 
 from sqlalchemy import (
     BigInteger,
+    Integer,
     String,
     Text,
     Boolean,
+    DateTime,
+    Numeric,
+    JSON,
     ForeignKey,
     UniqueConstraint,
+    Index,
     Enum as SAEnum,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -19,7 +29,7 @@ from app.db import Base
 
 
 class DocumentStatus(str, enum.Enum):
-    """文档在业务流转中的状态枚举。"""
+    """文档在审核/嵌入流程中的状态枚举。"""
 
     pending = "pending"
     approved = "approved"
@@ -27,6 +37,28 @@ class DocumentStatus(str, enum.Enum):
     embedded = "embedded"
 
 
+class AuditDecision(str, enum.Enum):
+    """管理员对上传文档的审核结论。"""
+    approved = "approved"
+    rejected = "rejected"
+
+
+class EmbeddingTaskStatus(str, enum.Enum):
+    """异步嵌入任务状态。"""
+    queued = "queued"
+    running = "running"
+    success = "success"
+    failed = "failed"
+
+
+class SenderRole(str, enum.Enum):
+    """对话消息发送者角色。"""
+    user = "user"
+    assistant = "assistant"
+    system = "system"
+
+
+# --- 账号与用户 ---
 class Admin(Base):
     __tablename__ = "admins"
 
@@ -62,6 +94,7 @@ class Teacher(Base):
     classes: Mapped[List["Class"]] = relationship(back_populates="teacher")  # 一个教师可对应多个班级
 
 
+# --- 班级与知识库 ---
 class Class(Base):
     __tablename__ = "classes"
     __table_args__ = (UniqueConstraint("class_code"),)
@@ -127,8 +160,10 @@ class KnowledgeBase(Base):
     documents: Mapped[List["Document"]] = relationship(back_populates="kb")  # 知识库下的文件列表
 
 
+# --- 文档与审核 ---
 class Document(Base):
     __tablename__ = "documents"
+    __table_args__ = (Index("ix_documents_kb_id_filename", "kb_id", "filename"),)
 
     # 文档表：记录文件元数据与上传者
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 主键
@@ -162,3 +197,175 @@ class Document(Base):
     uploader_student: Mapped[Optional[Student]] = relationship()  # 可能为学生
     uploader_teacher: Mapped[Optional[Teacher]] = relationship()  # 可能为教师
     uploader_admin: Mapped[Optional[Admin]] = relationship()  # 可能为管理员
+
+    audits: Mapped[List["DocumentAudit"]] = relationship(back_populates="document")
+    versions: Mapped[List["DocumentVersion"]] = relationship(back_populates="document")
+    embedding_tasks: Mapped[List["EmbeddingTask"]] = relationship(back_populates="document")
+
+
+class DocumentAudit(Base):
+    __tablename__ = "document_audits"
+    __table_args__ = (Index("ix_document_audits_document_id", "document_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("documents.id"), nullable=False
+    )
+    reviewer_admin_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("admins.id"), nullable=False
+    )
+    decision: Mapped[AuditDecision] = mapped_column(
+        SAEnum(AuditDecision), nullable=False
+    )
+    reason: Mapped[Optional[str]] = mapped_column(String(255))
+    decided_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+    document: Mapped[Document] = relationship(back_populates="audits")
+    reviewer_admin: Mapped[Admin] = relationship()
+
+
+class DocumentVersion(Base):
+    __tablename__ = "document_versions"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("documents.id"), nullable=False
+    )
+    version_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    storage_path: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+    document: Mapped[Document] = relationship(back_populates="versions")
+
+
+# --- 嵌入流程 ---
+class EmbeddingTask(Base):
+    __tablename__ = "embeddings_tasks"
+    __table_args__ = (
+        Index("ix_embeddings_tasks_document_id", "document_id"),
+        Index("ix_embeddings_tasks_status", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("documents.id"), nullable=False
+    )
+    triggered_by_teacher_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("teachers.id"), nullable=False
+    )
+    chunk_method: Mapped[str] = mapped_column(String(32), default="table")
+    status: Mapped[EmbeddingTaskStatus] = mapped_column(
+        SAEnum(EmbeddingTaskStatus), default=EmbeddingTaskStatus.queued
+    )
+    ragflow_task_id: Mapped[Optional[str]] = mapped_column(String(64))
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    message: Mapped[Optional[str]] = mapped_column(Text)
+
+    document: Mapped[Document] = relationship(back_populates="embedding_tasks")
+    triggered_by_teacher: Mapped[Teacher] = relationship()
+
+
+# --- 对话 ---
+class Conversation(Base):
+    __tablename__ = "conversations"
+    __table_args__ = (
+        Index("ix_conversations_owner_teacher_id", "owner_teacher_id"),
+        Index("ix_conversations_owner_student_id", "owner_student_id"),
+        Index("ix_conversations_kb_id", "kb_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    owner_teacher_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("teachers.id")
+    )
+    owner_student_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("students.id")
+    )
+    kb_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("knowledge_bases.id")
+    )
+    model_name: Mapped[Optional[str]] = mapped_column(String(64))
+    top_n: Mapped[int] = mapped_column(Integer, default=5)
+    similarity_threshold: Mapped[float] = mapped_column(Numeric(4, 3), default=0.2)
+    show_citations: Mapped[bool] = mapped_column(Boolean, default=True)
+    system_prompt: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    messages: Mapped[List["Message"]] = relationship(back_populates="conversation")
+    owner_teacher: Mapped[Optional[Teacher]] = relationship()
+    owner_student: Mapped[Optional[Student]] = relationship()
+    kb: Mapped[Optional[KnowledgeBase]] = relationship()
+
+
+class Message(Base):
+    __tablename__ = "messages"
+    __table_args__ = (Index("ix_messages_conversation_id", "conversation_id"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    conversation_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("conversations.id"), nullable=False
+    )
+    sender_role: Mapped[SenderRole] = mapped_column(
+        SAEnum(SenderRole), nullable=False
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    reference: Mapped[Optional[dict]] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+    conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+# --- 搜索日志 ---
+class SearchLog(Base):
+    __tablename__ = "search_logs"
+    __table_args__ = (
+        Index("ix_search_logs_user_teacher_id", "user_teacher_id"),
+        Index("ix_search_logs_user_student_id", "user_student_id"),
+        Index("ix_search_logs_kb_id_created_at", "kb_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_teacher_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("teachers.id")
+    )
+    user_student_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("students.id")
+    )
+    kb_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("knowledge_bases.id"), nullable=False
+    )
+    query: Mapped[str] = mapped_column(String(512), nullable=False)
+    result_count: Mapped[Optional[int]] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+
+    user_teacher: Mapped[Optional[Teacher]] = relationship()
+    user_student: Mapped[Optional[Student]] = relationship()
+    kb: Mapped[KnowledgeBase] = relationship()
+
+
+# --- RAGFlow 用户配置 ---
+class RagflowSetting(Base):
+    __tablename__ = "ragflow_settings"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    owner_teacher_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("teachers.id")
+    )
+    owner_student_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, ForeignKey("students.id")
+    )
+    api_base: Mapped[str] = mapped_column(String(255), default="http://localhost:8080")
+    api_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    default_model: Mapped[Optional[str]] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    owner_teacher: Mapped[Optional[Teacher]] = relationship()
+    owner_student: Mapped[Optional[Student]] = relationship()

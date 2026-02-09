@@ -8,10 +8,11 @@ services:
       MYSQL_DATABASE: casehub
       MYSQL_USER: casehub
       MYSQL_PASSWORD: ${MYSQL_PASSWORD:-casehubpwd}
+    command:
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
     volumes:
       - case-db-data:/var/lib/mysql
-    ports:
-      - "3307:3306"
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-rootpwd}"]
       interval: 10s
@@ -27,8 +28,8 @@ services:
     volumes:
       - case-minio-data:/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9100:9000"
+      - "9101:9001"
 
   case-api:
     build: ./backend

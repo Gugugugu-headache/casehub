@@ -1,4 +1,4 @@
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import declarative_base
 from app.config import get_settings
 
@@ -12,3 +12,9 @@ Example:
     async with AsyncSessionLocal() as session:
         ...
 """
+
+
+async def get_session() -> AsyncSession:
+    """FastAPI 依赖：提供异步数据库会话。"""
+    async with AsyncSessionLocal() as session:
+        yield session
