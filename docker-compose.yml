@@ -27,9 +27,6 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
     volumes:
       - case-minio-data:/data
-    ports:
-      - "9100:9000"
-      - "9101:9001"
 
   case-api:
     build: ./backend
