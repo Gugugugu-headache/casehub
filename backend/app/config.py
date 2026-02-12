@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic import AnyUrl
 from pydantic_settings import BaseSettings
 from functools import lru_cache
@@ -16,6 +18,7 @@ class Settings(BaseSettings):
 
     ragflow_base_url: AnyUrl = "http://localhost:8080"
     ragflow_api_key: str
+    ragflow_host_header: Optional[str] = None
 
     class Config:
         env_prefix = ""

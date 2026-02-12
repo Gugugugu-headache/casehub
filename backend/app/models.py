@@ -163,7 +163,11 @@ class KnowledgeBase(Base):
 # --- 文档与审核 ---
 class Document(Base):
     __tablename__ = "documents"
-    __table_args__ = (Index("ix_documents_kb_id_filename", "kb_id", "filename"),)
+    __table_args__ = (
+        Index("ix_documents_kb_id_filename", "kb_id", "filename"),
+        Index("ix_documents_kb_id_content_hash", "kb_id", "content_hash"),
+        UniqueConstraint("kb_id", "original_name", name="uq_documents_kb_original_name"),
+    )
 
     # 文档表：记录文件元数据与上传者
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)  # 主键
@@ -183,6 +187,7 @@ class Document(Base):
     )  # 管理员上传者
     size_bytes: Mapped[Optional[int]] = mapped_column(BigInteger)  # 文件大小
     mime_type: Mapped[Optional[str]] = mapped_column(String(128))  # MIME 类型
+    content_hash: Mapped[Optional[str]] = mapped_column(String(64))  # 文件内容 SHA256
     ragflow_document_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True)  # ragflow 返回的 doc id
     status: Mapped[DocumentStatus] = mapped_column(
         SAEnum(DocumentStatus), default=DocumentStatus.pending, nullable=False, index=True

@@ -1,13 +1,16 @@
 ﻿from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, func, delete
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from urllib.parse import urlparse
-from datetime import datetime
+from urllib.parse import urlparse, quote
+from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 import uuid
 import mimetypes
 import hashlib
+import io
 
 import httpx
 from minio import Minio
@@ -97,6 +100,24 @@ class DocumentSearchRequest(BaseModel):
     include_rejected: bool = False
 
 
+class RenameDocumentRequest(BaseModel):
+    """重命名文件请求体。"""
+
+    role: str
+    user_id: int
+    new_name: str
+    sync_ragflow: bool = True
+
+
+class DeleteDocumentRequest(BaseModel):
+    """删除文件请求体。"""
+
+    role: str
+    user_id: int
+    sync_ragflow: bool = True
+    remove_minio: bool = True
+
+
 # ------------------------------
 # 通用工具函数
 # ------------------------------
@@ -184,6 +205,14 @@ def _get_minio_client() -> Minio:
     )
 
 
+def _ragflow_headers() -> Dict[str, str]:
+    """构造 RAGFlow 请求头（可选指定 Host）。"""
+    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    if settings.ragflow_host_header:
+        headers["Host"] = settings.ragflow_host_header
+    return headers
+
+
 def _ensure_bucket(client: Minio, bucket: str) -> None:
     """确保桶存在。"""
     if not client.bucket_exists(bucket):
@@ -203,10 +232,66 @@ def _read_minio_object(client: Minio, bucket: str, object_name: str) -> bytes:
         raise HTTPException(status_code=500, detail=f"MinIO 读取失败: {exc.code}")
 
 
+def _safe_remove_minio_object(client: Minio, bucket: str, object_name: str) -> None:
+    """安全删除 MinIO 对象（不存在则忽略）。"""
+    try:
+        client.remove_object(bucket, object_name)
+    except S3Error as exc:
+        if exc.code in {"NoSuchKey", "NoSuchObject"}:
+            return
+        raise HTTPException(status_code=500, detail=f"MinIO 删除失败: {exc.code}")
+
+
+async def _check_document_permission(
+    session: AsyncSession,
+    role: str,
+    user_id: int,
+    cls: models.Class,
+) -> None:
+    """校验单个文档的访问权限。"""
+    role = role.lower().strip()
+
+    if role == "student":
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not student or student.status != 1:
+            raise HTTPException(status_code=403, detail="学生不存在或已停用")
+        if student.class_id != cls.id:
+            raise HTTPException(status_code=403, detail="无权访问该班级文件")
+        return
+
+    if role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+        if cls.teacher_id != teacher.id:
+            raise HTTPException(status_code=403, detail="无权访问该班级文件")
+        return
+
+    if role == "admin":
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not admin or admin.status != 1:
+            raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+        return
+
+    raise HTTPException(status_code=400, detail="role 参数不合法")
+
+
 async def _create_ragflow_dataset(payload: CreateClassRequest) -> str:
     """调用 RAGFlow 创建数据集，返回 dataset_id。"""
     base_url = str(settings.ragflow_base_url).rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    headers = _ragflow_headers()
     body = {
         "name": payload.class_code,
         "embedding_model": payload.embedding_model,
@@ -241,7 +326,7 @@ async def _create_ragflow_dataset(payload: CreateClassRequest) -> str:
 async def _ragflow_upload_document(dataset_id: str, filename: str, data: bytes, content_type: str) -> str:
     """上传文件到 RAGFlow，返回 ragflow_document_id。"""
     base_url = str(settings.ragflow_base_url).rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    headers = _ragflow_headers()
     files = {"file": (filename, data, content_type)}
 
     async with httpx.AsyncClient(timeout=60) as client:
@@ -273,7 +358,7 @@ async def _ragflow_upload_document(dataset_id: str, filename: str, data: bytes, 
 async def _ragflow_parse_documents(dataset_id: str, document_ids: List[str]) -> None:
     """调用 RAGFlow 进行解析/嵌入。"""
     base_url = str(settings.ragflow_base_url).rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    headers = _ragflow_headers()
     body = {"document_ids": document_ids}
 
     async with httpx.AsyncClient(timeout=60) as client:
@@ -292,10 +377,58 @@ async def _ragflow_parse_documents(dataset_id: str, document_ids: List[str]) -> 
         raise HTTPException(status_code=502, detail=f"RAGFlow 解析失败: {message}")
 
 
+async def _ragflow_update_document_name(dataset_id: str, document_id: str, new_name: str) -> None:
+    """同步更新 RAGFlow 文档名称。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"name": new_name}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.put(
+            f"{base_url}/api/v1/datasets/{dataset_id}/documents/{document_id}",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 重命名失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 重命名失败: {message}")
+
+
+async def _ragflow_delete_documents(dataset_id: str, document_ids: List[str]) -> None:
+    """同步删除 RAGFlow 文档。"""
+    if not document_ids:
+        return
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"ids": document_ids}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        # httpx 旧版本 delete 不支持 json 参数，使用 request 兼容
+        resp = await client.request(
+            "DELETE",
+            f"{base_url}/api/v1/datasets/{dataset_id}/documents",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除失败: {message}")
+
+
 async def _ragflow_get_chunk(dataset_id: str, document_id: str, chunk_id: str) -> Dict[str, Any]:
     """从 RAGFlow 查询单个 chunk 内容，用于“点击查看案例”。"""
     base_url = str(settings.ragflow_base_url).rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    headers = _ragflow_headers()
     params = {"id": chunk_id, "page": 1, "page_size": 1}
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -535,6 +668,130 @@ async def _resolve_kb_for_search(
     raise HTTPException(status_code=400, detail="role 参数不合法")
 
 
+async def _resolve_document_scope(
+    session: AsyncSession,
+    role: str,
+    user_id: int,
+    kb_id: Optional[int],
+    class_id: Optional[int],
+    class_code: Optional[str],
+) -> Dict[str, Optional[int]]:
+    """解析文件列表的查询范围，并做权限校验。"""
+    role = role.lower().strip()
+
+    # 先将班级编号解析为 class_id
+    if class_id is None and class_code is not None:
+        cls = (
+            await session.execute(
+                select(models.Class).where(models.Class.class_code == class_code)
+            )
+        ).scalar_one_or_none()
+        if not cls:
+            raise HTTPException(status_code=404, detail="班级不存在")
+        class_id = cls.id
+
+    # 学生：只能查看自己班级
+    if role == "student":
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not student or student.status != 1:
+            raise HTTPException(status_code=403, detail="学生不存在或已停用")
+
+        if class_id is not None and class_id != student.class_id:
+            raise HTTPException(status_code=403, detail="无权访问该班级")
+
+        if kb_id is not None:
+            kb = (
+                await session.execute(
+                    select(models.KnowledgeBase).where(models.KnowledgeBase.id == kb_id)
+                )
+            ).scalar_one_or_none()
+            if not kb:
+                raise HTTPException(status_code=404, detail="知识库不存在")
+            if kb.class_id != student.class_id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
+            return {"kb_id": kb.id, "class_id": None}
+
+        return {"kb_id": None, "class_id": student.class_id}
+
+    # 教师：若有多个班级，必须选择
+    if role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+
+        if kb_id is not None:
+            kb = (
+                await session.execute(
+                    select(models.KnowledgeBase).where(models.KnowledgeBase.id == kb_id)
+                )
+            ).scalar_one_or_none()
+            if not kb:
+                raise HTTPException(status_code=404, detail="知识库不存在")
+            cls = (
+                await session.execute(
+                    select(models.Class).where(models.Class.id == kb.class_id)
+                )
+            ).scalar_one_or_none()
+            if not cls or cls.teacher_id != teacher.id:
+                raise HTTPException(status_code=403, detail="无权访问该知识库")
+            return {"kb_id": kb.id, "class_id": None}
+
+        if class_id is None:
+            classes = (
+                await session.execute(
+                    select(models.Class).where(models.Class.teacher_id == teacher.id)
+                )
+            ).scalars().all()
+            if len(classes) == 1:
+                class_id = classes[0].id
+            else:
+                raise HTTPException(status_code=400, detail="请先选择班级")
+
+        cls = (
+            await session.execute(
+                select(models.Class).where(models.Class.id == class_id)
+            )
+        ).scalar_one_or_none()
+        if not cls:
+            raise HTTPException(status_code=404, detail="班级不存在")
+        if cls.teacher_id != teacher.id:
+            raise HTTPException(status_code=403, detail="无权访问该班级")
+
+        return {"kb_id": None, "class_id": cls.id}
+
+    # 管理员：可查看任意班级/知识库
+    if role == "admin":
+        if kb_id is not None:
+            kb = (
+                await session.execute(
+                    select(models.KnowledgeBase).where(models.KnowledgeBase.id == kb_id)
+                )
+            ).scalar_one_or_none()
+            if not kb:
+                raise HTTPException(status_code=404, detail="知识库不存在")
+            return {"kb_id": kb.id, "class_id": None}
+        if class_id is not None:
+            cls = (
+                await session.execute(
+                    select(models.Class).where(models.Class.id == class_id)
+                )
+            ).scalar_one_or_none()
+            if not cls:
+                raise HTTPException(status_code=404, detail="班级不存在")
+            return {"kb_id": None, "class_id": cls.id}
+        return {"kb_id": None, "class_id": None}
+
+    raise HTTPException(status_code=400, detail="role 参数不合法")
+
+
 def _extract_ragflow_doc_id(item: Dict[str, Any]) -> Optional[str]:
     """从 RAGFlow chunk 中提取 document id。"""
     if not isinstance(item, dict):
@@ -612,6 +869,34 @@ def _format_search_chunks(
             }
         )
     return results
+
+
+def _parse_date(value: Optional[str], field_name: str) -> Optional[datetime]:
+    """解析日期字符串（支持 YYYY-MM-DD 或 ISO8601）。"""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"{field_name} 格式错误")
+
+
+async def _resolve_class_id(
+    session: AsyncSession,
+    class_id: Optional[int],
+    class_code: Optional[str],
+) -> Optional[int]:
+    """将班级编号解析为班级 ID（用于过滤统计范围）。"""
+    if class_id is None and class_code is not None:
+        cls = (
+            await session.execute(
+                select(models.Class).where(models.Class.class_code == class_code)
+            )
+        ).scalar_one_or_none()
+        if not cls:
+            raise HTTPException(status_code=404, detail="班级不存在")
+        class_id = cls.id
+    return class_id
 
 
 # ------------------------------
@@ -763,11 +1048,36 @@ async def upload_document(
 
     kb = await _resolve_kb(session, role, uploader_id, class_id, class_code, kb_id)
 
+    # 同班级同名禁止（排除已拒绝的记录）
+    reuse_doc: Optional[models.Document] = None
+    if file.filename:
+        exists = (
+            await session.execute(
+                select(models.Document).where(
+                    models.Document.kb_id == kb.id,
+                    models.Document.original_name == file.filename,
+                )
+            )
+        ).scalar_one_or_none()
+        if exists and exists.status != models.DocumentStatus.rejected:
+            raise HTTPException(status_code=409, detail="同名文件已存在，请更换文件名后再上传")
+        if exists and exists.status == models.DocumentStatus.rejected:
+            reuse_doc = exists
+
     client = _get_minio_client()
     pending_bucket = settings.minio_bucket_pending
     kb_bucket = settings.minio_bucket_kb
     _ensure_bucket(client, pending_bucket)
     _ensure_bucket(client, kb_bucket)
+
+    # 如果是被拒绝的旧文件，先清理旧对象，避免冗余占用
+    if reuse_doc and reuse_doc.storage_path:
+        old_bucket = (
+            pending_bucket
+            if reuse_doc.status in {models.DocumentStatus.pending, models.DocumentStatus.rejected}
+            else kb_bucket
+        )
+        _safe_remove_minio_object(client, old_bucket, reuse_doc.storage_path)
 
     status = (
         models.DocumentStatus.pending
@@ -782,6 +1092,13 @@ async def upload_document(
         ext = f".{ext}" if ext else ""
     object_name = f"{kb.id}/{datetime.utcnow().strftime('%Y%m%d')}/{uuid.uuid4().hex}{ext}"
 
+    # 计算文件内容哈希（用于同内容提醒）
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="上传文件为空")
+    size_bytes = len(data)
+    content_hash = hashlib.sha256(data).hexdigest()
+
     content_type = (
         file.content_type
         or mimetypes.guess_type(file.filename or "")[0]
@@ -791,39 +1108,370 @@ async def upload_document(
         client.put_object(
             target_bucket,
             object_name,
-            file.file,
-            length=-1,
+            io.BytesIO(data),
+            length=size_bytes,
             part_size=10 * 1024 * 1024,
             content_type=content_type,
         )
     except S3Error as exc:
         raise HTTPException(status_code=500, detail=f"MinIO 上传失败: {exc.code}")
 
-    doc = models.Document(
-        kb_id=kb.id,
-        filename=object_name,
-        original_name=file.filename or "",
-        uploader_student_id=uploader_id if role == "student" else None,
-        uploader_teacher_id=uploader_id if role == "teacher" else None,
-        uploader_admin_id=uploader_id if role == "admin" else None,
-        size_bytes=None,
-        mime_type=content_type,
-        ragflow_document_id=None,
-        status=status,
-        storage_path=object_name,
-        uploaded_at=datetime.utcnow(),
-        updated_at=datetime.utcnow(),
+    duplicate_stmt = select(models.Document).where(
+        models.Document.kb_id == kb.id,
+        models.Document.content_hash == content_hash,
     )
-    session.add(doc)
-    await session.commit()
-    await session.refresh(doc)
+    if reuse_doc:
+        duplicate_stmt = duplicate_stmt.where(models.Document.id != reuse_doc.id)
+    duplicate_doc = (await session.execute(duplicate_stmt)).scalar_one_or_none()
+
+    if reuse_doc:
+        # 复用已拒绝的记录，避免同名唯一约束冲突
+        doc = reuse_doc
+        doc.filename = object_name
+        doc.original_name = file.filename or ""
+        doc.uploader_student_id = uploader_id if role == "student" else None
+        doc.uploader_teacher_id = uploader_id if role == "teacher" else None
+        doc.uploader_admin_id = uploader_id if role == "admin" else None
+        doc.size_bytes = size_bytes
+        doc.mime_type = content_type
+        doc.content_hash = content_hash
+        doc.ragflow_document_id = None
+        doc.status = status
+        doc.storage_path = object_name
+        doc.uploaded_at = datetime.utcnow()
+        doc.updated_at = datetime.utcnow()
+    else:
+        doc = models.Document(
+            kb_id=kb.id,
+            filename=object_name,
+            original_name=file.filename or "",
+            uploader_student_id=uploader_id if role == "student" else None,
+            uploader_teacher_id=uploader_id if role == "teacher" else None,
+            uploader_admin_id=uploader_id if role == "admin" else None,
+            size_bytes=size_bytes,
+            mime_type=content_type,
+            content_hash=content_hash,
+            ragflow_document_id=None,
+            status=status,
+            storage_path=object_name,
+            uploaded_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        session.add(doc)
+
+    try:
+        await session.commit()
+        await session.refresh(doc)
+    except IntegrityError:
+        await session.rollback()
+        _safe_remove_minio_object(client, target_bucket, object_name)
+        raise HTTPException(status_code=409, detail="同名文件已存在，请更换文件名后再上传")
 
     return {
         "id": doc.id,
         "kb_id": doc.kb_id,
         "status": doc.status.value,
         "filename": doc.original_name,
+        "content_duplicate": bool(duplicate_doc),
+        "duplicate_document_id": duplicate_doc.id if duplicate_doc else None,
+        "duplicate_document_name": duplicate_doc.original_name if duplicate_doc else None,
     }
+
+
+@app.get("/documents")
+async def list_documents(
+    role: str,
+    user_id: int,
+    kb_id: Optional[int] = None,
+    class_id: Optional[int] = None,
+    class_code: Optional[str] = None,
+    status: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    filename: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """文件列表（支持分页与权限控制）。"""
+    role = role.lower().strip()
+    if role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="role 参数不合法")
+
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=400, detail="分页参数不合法")
+
+    scope = await _resolve_document_scope(
+        session,
+        role,
+        user_id,
+        kb_id,
+        class_id,
+        class_code,
+    )
+
+    # 状态过滤：默认仅展示已通过/已嵌入文件
+    if status:
+        raw_statuses = [s.strip() for s in status.split(",") if s.strip()]
+        try:
+            status_values = [models.DocumentStatus(s) for s in raw_statuses]
+        except ValueError:
+            raise HTTPException(status_code=400, detail="status 参数不合法")
+    else:
+        status_values = [models.DocumentStatus.approved, models.DocumentStatus.embedded]
+
+    # 非管理员不允许查看拒绝/待审核
+    if role != "admin":
+        forbidden = {models.DocumentStatus.pending, models.DocumentStatus.rejected}
+        if any(s in forbidden for s in status_values):
+            raise HTTPException(status_code=403, detail="无权查看该状态的文件")
+
+    base_stmt = (
+        select(models.Document, models.KnowledgeBase, models.Class)
+        .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+        .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+        .where(models.Document.status.in_(status_values))
+    )
+
+    if scope.get("kb_id"):
+        base_stmt = base_stmt.where(models.Document.kb_id == scope["kb_id"])
+    elif scope.get("class_id"):
+        base_stmt = base_stmt.where(models.KnowledgeBase.class_id == scope["class_id"])
+
+    keyword = (filename or "").strip()
+    if keyword:
+        base_stmt = base_stmt.where(models.Document.original_name.like(f"%{keyword}%"))
+
+    total_stmt = select(func.count()).select_from(base_stmt.subquery())
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    rows = (
+        await session.execute(
+            base_stmt
+            .order_by(models.Document.uploaded_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items = [
+        {
+            "document_id": doc.id,
+            "document_name": doc.original_name,
+            "status": doc.status.value,
+            "uploaded_at": doc.uploaded_at,
+            "ragflow_document_id": doc.ragflow_document_id,
+            "kb_id": kb.id,
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+            "uploader_student_id": doc.uploader_student_id,
+            "uploader_teacher_id": doc.uploader_teacher_id,
+            "uploader_admin_id": doc.uploader_admin_id,
+        }
+        for doc, kb, cls in rows
+    ]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": items,
+    }
+
+
+@app.get("/documents/{document_id}")
+async def get_document_detail(
+    document_id: int,
+    role: str,
+    user_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """文件详情（用于前端详情页/预览准备）。"""
+    role = role.lower().strip()
+    if role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="role 参数不合法")
+
+    row = (
+        await session.execute(
+            select(models.Document, models.KnowledgeBase, models.Class)
+            .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .where(models.Document.id == document_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    doc, kb, cls = row
+    await _check_document_permission(session, role, user_id, cls)
+
+    # 非管理员不允许查看待审核/已拒绝
+    if role != "admin" and doc.status in {
+        models.DocumentStatus.pending,
+        models.DocumentStatus.rejected,
+    }:
+        raise HTTPException(status_code=403, detail="无权查看该状态的文件")
+
+    uploader = None
+    if doc.uploader_student_id:
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == doc.uploader_student_id)
+            )
+        ).scalar_one_or_none()
+        if student:
+            uploader = {
+                "role": "student",
+                "id": student.id,
+                "no": student.student_no,
+                "name": student.name,
+            }
+    elif doc.uploader_teacher_id:
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == doc.uploader_teacher_id)
+            )
+        ).scalar_one_or_none()
+        if teacher:
+            uploader = {
+                "role": "teacher",
+                "id": teacher.id,
+                "no": teacher.teacher_no,
+                "name": teacher.name,
+            }
+    elif doc.uploader_admin_id:
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == doc.uploader_admin_id)
+            )
+        ).scalar_one_or_none()
+        if admin:
+            uploader = {
+                "role": "admin",
+                "id": admin.id,
+                "no": admin.admin_no,
+                "name": admin.name,
+            }
+
+    audit_rows = (
+        await session.execute(
+            select(models.DocumentAudit, models.Admin)
+            .join(models.Admin, models.DocumentAudit.reviewer_admin_id == models.Admin.id)
+            .where(models.DocumentAudit.document_id == doc.id)
+            .order_by(models.DocumentAudit.decided_at.desc())
+        )
+    ).all()
+    audits = [
+        {
+            "id": audit.id,
+            "decision": audit.decision.value,
+            "reason": audit.reason,
+            "decided_at": audit.decided_at,
+            "reviewer_admin_id": admin.id,
+            "reviewer_admin_name": admin.name,
+        }
+        for audit, admin in audit_rows
+    ]
+
+    task_rows = (
+        await session.execute(
+            select(models.EmbeddingTask)
+            .where(models.EmbeddingTask.document_id == doc.id)
+            .order_by(models.EmbeddingTask.started_at.desc())
+        )
+    ).scalars().all()
+    embedding_tasks = [
+        {
+            "id": task.id,
+            "status": task.status.value,
+            "chunk_method": task.chunk_method,
+            "ragflow_task_id": task.ragflow_task_id,
+            "started_at": task.started_at,
+            "finished_at": task.finished_at,
+            "message": task.message,
+        }
+        for task in task_rows
+    ]
+
+    return {
+        "document_id": doc.id,
+        "document_name": doc.original_name,
+        "status": doc.status.value,
+        "kb_id": kb.id,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+        "ragflow_dataset_id": kb.ragflow_dataset_id,
+        "ragflow_document_id": doc.ragflow_document_id,
+        "size_bytes": doc.size_bytes,
+        "mime_type": doc.mime_type,
+        "uploaded_at": doc.uploaded_at,
+        "updated_at": doc.updated_at,
+        "uploader": uploader,
+        "audits": audits,
+        "embedding_tasks": embedding_tasks,
+        "content_url": f"/documents/{doc.id}/content",
+    }
+
+
+@app.get("/documents/{document_id}/content")
+async def get_document_content(
+    document_id: int,
+    role: str,
+    user_id: int,
+    download: bool = False,
+    session: AsyncSession = Depends(get_session),
+):
+    """文件内容下载/预览（前端用于 Excel 预览）。"""
+    role = role.lower().strip()
+    if role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="role 参数不合法")
+
+    row = (
+        await session.execute(
+            select(models.Document, models.KnowledgeBase, models.Class)
+            .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .where(models.Document.id == document_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    doc, kb, cls = row
+    await _check_document_permission(session, role, user_id, cls)
+
+    # 非管理员不允许下载待审核/已拒绝文件
+    if role != "admin" and doc.status in {
+        models.DocumentStatus.pending,
+        models.DocumentStatus.rejected,
+    }:
+        raise HTTPException(status_code=403, detail="无权下载该状态的文件")
+
+    if not doc.storage_path:
+        raise HTTPException(status_code=404, detail="文件存储路径缺失")
+
+    client = _get_minio_client()
+    pending_bucket = settings.minio_bucket_pending
+    kb_bucket = settings.minio_bucket_kb
+    _ensure_bucket(client, pending_bucket)
+    _ensure_bucket(client, kb_bucket)
+    target_bucket = (
+        pending_bucket
+        if doc.status in {models.DocumentStatus.pending, models.DocumentStatus.rejected}
+        else kb_bucket
+    )
+
+    data = _read_minio_object(client, target_bucket, doc.storage_path)
+    filename = doc.original_name or doc.filename or f"document-{doc.id}"
+    content_type = doc.mime_type or "application/octet-stream"
+    disposition = "attachment" if download else "inline"
+    headers = {"Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(filename)}"}
+
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=content_type,
+        headers=headers,
+    )
 
 
 @app.post("/documents/search")
@@ -885,6 +1533,164 @@ async def search_documents_by_filename(
     ]
 
 
+@app.put("/documents/{document_id}/rename")
+async def rename_document(
+    document_id: int,
+    payload: RenameDocumentRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """重命名文件（仅更新展示名称，不改存储路径）。"""
+    role = payload.role.lower().strip()
+    if role not in {"teacher", "admin"}:
+        raise HTTPException(status_code=403, detail="仅教师或管理员可重命名文件")
+
+    new_name = (payload.new_name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="new_name 不能为空")
+    if len(new_name) > 255:
+        raise HTTPException(status_code=400, detail="new_name 过长")
+
+    row = (
+        await session.execute(
+            select(models.Document, models.KnowledgeBase, models.Class)
+            .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .where(models.Document.id == document_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    doc, kb, cls = row
+
+    if role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == payload.user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+        if cls.teacher_id != teacher.id:
+            raise HTTPException(status_code=403, detail="无权操作该班级文件")
+
+    if role == "admin":
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == payload.user_id)
+            )
+        ).scalar_one_or_none()
+        if not admin or admin.status != 1:
+            raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+
+    # 同步更新 RAGFlow 文档名称（如果存在）
+    if payload.sync_ragflow and doc.ragflow_document_id:
+        await _ragflow_update_document_name(
+            kb.ragflow_dataset_id,
+            doc.ragflow_document_id,
+            new_name,
+        )
+
+    doc.original_name = new_name
+    doc.updated_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(doc)
+
+    return {
+        "document_id": doc.id,
+        "document_name": doc.original_name,
+        "kb_id": doc.kb_id,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+        "ragflow_document_id": doc.ragflow_document_id,
+        "updated_at": doc.updated_at,
+    }
+
+
+@app.delete("/documents/{document_id}")
+async def delete_document(
+    document_id: int,
+    payload: DeleteDocumentRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """删除文件（数据库 + MinIO + 可选同步 RAGFlow）。"""
+    role = payload.role.lower().strip()
+    if role not in {"teacher", "admin"}:
+        raise HTTPException(status_code=403, detail="仅教师或管理员可删除文件")
+
+    row = (
+        await session.execute(
+            select(models.Document, models.KnowledgeBase, models.Class)
+            .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .where(models.Document.id == document_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    doc, kb, cls = row
+
+    if role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == payload.user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+        if cls.teacher_id != teacher.id:
+            raise HTTPException(status_code=403, detail="无权删除该班级文件")
+
+    if role == "admin":
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == payload.user_id)
+            )
+        ).scalar_one_or_none()
+        if not admin or admin.status != 1:
+            raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+
+    # 1) 先同步删除 RAGFlow 文档（若有）
+    if payload.sync_ragflow and doc.ragflow_document_id:
+        await _ragflow_delete_documents(kb.ragflow_dataset_id, [doc.ragflow_document_id])
+
+    # 2) 删除 MinIO 对象（按状态选择桶）
+    if payload.remove_minio and doc.storage_path:
+        client = _get_minio_client()
+        pending_bucket = settings.minio_bucket_pending
+        kb_bucket = settings.minio_bucket_kb
+        _ensure_bucket(client, pending_bucket)
+        _ensure_bucket(client, kb_bucket)
+        target_bucket = (
+            pending_bucket
+            if doc.status in {models.DocumentStatus.pending, models.DocumentStatus.rejected}
+            else kb_bucket
+        )
+        _safe_remove_minio_object(client, target_bucket, doc.storage_path)
+
+    # 3) 删除关联记录（避免外键约束）
+    await session.execute(
+        delete(models.DocumentAudit).where(models.DocumentAudit.document_id == doc.id)
+    )
+    await session.execute(
+        delete(models.DocumentVersion).where(models.DocumentVersion.document_id == doc.id)
+    )
+    await session.execute(
+        delete(models.EmbeddingTask).where(models.EmbeddingTask.document_id == doc.id)
+    )
+
+    # 4) 删除文档记录
+    await session.delete(doc)
+    await session.commit()
+
+    return {
+        "document_id": document_id,
+        "deleted": True,
+    }
+
+
 @app.get("/audits/pending")
 async def list_pending_audits(
     class_id: Optional[int] = None,
@@ -923,6 +1729,213 @@ async def list_pending_audits(
         }
         for d in rows
     ]
+
+
+@app.get("/audits")
+async def list_audits(
+    admin_id: int,
+    class_id: Optional[int] = None,
+    class_code: Optional[str] = None,
+    decision: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    filename: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """审核记录列表（仅管理员可查看）。"""
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=400, detail="分页参数不合法")
+
+    admin = (
+        await session.execute(
+            select(models.Admin).where(models.Admin.id == admin_id)
+        )
+    ).scalar_one_or_none()
+    if not admin or admin.status != 1:
+        raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+
+    if class_id is None and class_code is not None:
+        cls = (
+            await session.execute(
+                select(models.Class).where(models.Class.class_code == class_code)
+            )
+        ).scalar_one_or_none()
+        if not cls:
+            raise HTTPException(status_code=404, detail="班级不存在")
+        class_id = cls.id
+
+    if decision:
+        decision = decision.lower().strip()
+        if decision not in {"approved", "rejected"}:
+            raise HTTPException(status_code=400, detail="decision 参数不合法")
+
+    base_stmt = (
+        select(
+            models.DocumentAudit,
+            models.Document,
+            models.KnowledgeBase,
+            models.Class,
+            models.Admin,
+        )
+        .join(models.Document, models.DocumentAudit.document_id == models.Document.id)
+        .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+        .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+        .join(models.Admin, models.DocumentAudit.reviewer_admin_id == models.Admin.id)
+    )
+
+    if class_id is not None:
+        base_stmt = base_stmt.where(models.Class.id == class_id)
+
+    if decision:
+        base_stmt = base_stmt.where(
+            models.DocumentAudit.decision == models.AuditDecision(decision)
+        )
+
+    keyword = (filename or "").strip()
+    if keyword:
+        base_stmt = base_stmt.where(models.Document.original_name.like(f"%{keyword}%"))
+
+    total_stmt = select(func.count()).select_from(base_stmt.subquery())
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    rows = (
+        await session.execute(
+            base_stmt
+            .order_by(models.DocumentAudit.decided_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items = [
+        {
+            "audit_id": audit.id,
+            "document_id": doc.id,
+            "document_name": doc.original_name,
+            "document_status": doc.status.value,
+            "decision": audit.decision.value,
+            "reason": audit.reason,
+            "decided_at": audit.decided_at,
+            "reviewer_admin_id": reviewer.id,
+            "reviewer_admin_name": reviewer.name,
+            "kb_id": kb.id,
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+            "uploader_student_id": doc.uploader_student_id,
+            "uploader_teacher_id": doc.uploader_teacher_id,
+            "uploader_admin_id": doc.uploader_admin_id,
+            "uploaded_at": doc.uploaded_at,
+        }
+        for audit, doc, kb, cls, reviewer in rows
+    ]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": items,
+    }
+
+
+@app.get("/audits/{audit_id}")
+async def get_audit_detail(
+    audit_id: int,
+    admin_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """审核记录详情（仅管理员可查看）。"""
+    admin = (
+        await session.execute(
+            select(models.Admin).where(models.Admin.id == admin_id)
+        )
+    ).scalar_one_or_none()
+    if not admin or admin.status != 1:
+        raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+
+    row = (
+        await session.execute(
+            select(
+                models.DocumentAudit,
+                models.Document,
+                models.KnowledgeBase,
+                models.Class,
+                models.Admin,
+            )
+            .join(models.Document, models.DocumentAudit.document_id == models.Document.id)
+            .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .join(models.Admin, models.DocumentAudit.reviewer_admin_id == models.Admin.id)
+            .where(models.DocumentAudit.id == audit_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="审核记录不存在")
+
+    audit, doc, kb, cls, reviewer = row
+
+    uploader = None
+    if doc.uploader_student_id:
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == doc.uploader_student_id)
+            )
+        ).scalar_one_or_none()
+        if student:
+            uploader = {
+                "role": "student",
+                "id": student.id,
+                "no": student.student_no,
+                "name": student.name,
+            }
+    elif doc.uploader_teacher_id:
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == doc.uploader_teacher_id)
+            )
+        ).scalar_one_or_none()
+        if teacher:
+            uploader = {
+                "role": "teacher",
+                "id": teacher.id,
+                "no": teacher.teacher_no,
+                "name": teacher.name,
+            }
+    elif doc.uploader_admin_id:
+        admin_uploader = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == doc.uploader_admin_id)
+            )
+        ).scalar_one_or_none()
+        if admin_uploader:
+            uploader = {
+                "role": "admin",
+                "id": admin_uploader.id,
+                "no": admin_uploader.admin_no,
+                "name": admin_uploader.name,
+            }
+
+    return {
+        "audit_id": audit.id,
+        "decision": audit.decision.value,
+        "reason": audit.reason,
+        "decided_at": audit.decided_at,
+        "reviewer_admin_id": reviewer.id,
+        "reviewer_admin_name": reviewer.name,
+        "document": {
+            "document_id": doc.id,
+            "document_name": doc.original_name,
+            "status": doc.status.value,
+            "kb_id": kb.id,
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+            "ragflow_document_id": doc.ragflow_document_id,
+            "uploaded_at": doc.uploaded_at,
+            "content_url": f"/documents/{doc.id}/content",
+        },
+        "uploader": uploader,
+    }
 
 
 @app.post("/audits/{document_id}/decision")
@@ -1108,7 +2121,7 @@ async def search_cases(
         raise HTTPException(status_code=400, detail="知识库未绑定 RAGFlow dataset")
 
     base_url = str(settings.ragflow_base_url).rstrip("/")
-    headers = {"Authorization": f"Bearer {settings.ragflow_api_key}"}
+    headers = _ragflow_headers()
     body = {
         "question": payload.query,
         "dataset_ids": [kb.ragflow_dataset_id],
@@ -1172,6 +2185,251 @@ async def search_cases(
         "ragflow_dataset_id": kb.ragflow_dataset_id,
         "result_count": len(formatted),
         "chunks": formatted,
+    }
+
+
+@app.get("/search/logs")
+async def list_search_logs(
+    role: str,
+    user_id: int,
+    class_id: Optional[int] = None,
+    class_code: Optional[str] = None,
+    kb_id: Optional[int] = None,
+    query: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    session: AsyncSession = Depends(get_session),
+):
+    """搜索日志列表（管理员可看全量，教师/学生仅看自己的）。"""
+    role = role.lower().strip()
+    if role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="role 参数不合法")
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=400, detail="分页参数不合法")
+
+    # 权限校验
+    if role == "admin":
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not admin or admin.status != 1:
+            raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+    elif role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+    else:
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not student or student.status != 1:
+            raise HTTPException(status_code=403, detail="学生不存在或已停用")
+
+    class_id = await _resolve_class_id(session, class_id, class_code)
+    dt_from = _parse_date(date_from, "date_from")
+    dt_to = _parse_date(date_to, "date_to")
+
+    base_stmt = (
+        select(models.SearchLog, models.KnowledgeBase, models.Class)
+        .join(models.KnowledgeBase, models.SearchLog.kb_id == models.KnowledgeBase.id)
+        .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+    )
+
+    filters = []
+    if kb_id is not None:
+        filters.append(models.SearchLog.kb_id == kb_id)
+    if class_id is not None:
+        filters.append(models.Class.id == class_id)
+    if role == "teacher":
+        filters.append(models.SearchLog.user_teacher_id == user_id)
+    if role == "student":
+        filters.append(models.SearchLog.user_student_id == user_id)
+    if query:
+        filters.append(models.SearchLog.query.like(f"%{query.strip()}%"))
+    if dt_from:
+        filters.append(models.SearchLog.created_at >= dt_from)
+    if dt_to:
+        # 仅传日期时，默认包含当天
+        if "T" not in date_to and len(date_to) <= 10:
+            filters.append(models.SearchLog.created_at < dt_to + timedelta(days=1))
+        else:
+            filters.append(models.SearchLog.created_at <= dt_to)
+
+    if filters:
+        base_stmt = base_stmt.where(*filters)
+
+    total_stmt = select(func.count()).select_from(base_stmt.subquery())
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    rows = (
+        await session.execute(
+            base_stmt
+            .order_by(models.SearchLog.created_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items = []
+    for log, kb_row, cls in rows:
+        user_role = "teacher" if log.user_teacher_id else "student"
+        user_id_value = log.user_teacher_id or log.user_student_id
+        items.append(
+            {
+                "log_id": log.id,
+                "query": log.query,
+                "result_count": log.result_count,
+                "created_at": log.created_at,
+                "user_role": user_role,
+                "user_id": user_id_value,
+                "kb_id": kb_row.id,
+                "class_id": cls.id,
+                "class_code": cls.class_code,
+                "class_name": cls.class_name,
+            }
+        )
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": items,
+    }
+
+
+@app.get("/search/stats")
+async def search_stats(
+    role: str,
+    user_id: int,
+    class_id: Optional[int] = None,
+    class_code: Optional[str] = None,
+    kb_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    days: int = 30,
+    top_n: int = 10,
+    session: AsyncSession = Depends(get_session),
+):
+    """搜索统计（管理员可看全量，教师/学生仅看自己的）。"""
+    role = role.lower().strip()
+    if role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="role 参数不合法")
+    if top_n < 1 or top_n > 50:
+        raise HTTPException(status_code=400, detail="top_n 参数不合法")
+
+    # 权限校验
+    if role == "admin":
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not admin or admin.status != 1:
+            raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+    elif role == "teacher":
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not teacher or teacher.status != 1:
+            raise HTTPException(status_code=403, detail="教师不存在或已停用")
+    else:
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == user_id)
+            )
+        ).scalar_one_or_none()
+        if not student or student.status != 1:
+            raise HTTPException(status_code=403, detail="学生不存在或已停用")
+
+    class_id = await _resolve_class_id(session, class_id, class_code)
+    dt_from = _parse_date(date_from, "date_from")
+    dt_to = _parse_date(date_to, "date_to")
+
+    if not dt_from and not dt_to and days:
+        dt_from = datetime.utcnow() - timedelta(days=days)
+
+    filters = []
+    if kb_id is not None:
+        filters.append(models.SearchLog.kb_id == kb_id)
+    if class_id is not None:
+        filters.append(models.SearchLog.kb_id.in_(
+            select(models.KnowledgeBase.id).where(models.KnowledgeBase.class_id == class_id)
+        ))
+    if role == "teacher":
+        filters.append(models.SearchLog.user_teacher_id == user_id)
+    if role == "student":
+        filters.append(models.SearchLog.user_student_id == user_id)
+    if dt_from:
+        filters.append(models.SearchLog.created_at >= dt_from)
+    if dt_to:
+        if "T" not in date_to and len(date_to) <= 10:
+            filters.append(models.SearchLog.created_at < dt_to + timedelta(days=1))
+        else:
+            filters.append(models.SearchLog.created_at <= dt_to)
+
+    # 总搜索次数
+    total_stmt = select(func.count()).select_from(models.SearchLog)
+    if filters:
+        total_stmt = total_stmt.where(*filters)
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    # 独立教师/学生数
+    teacher_count_stmt = select(func.count(func.distinct(models.SearchLog.user_teacher_id))).where(
+        models.SearchLog.user_teacher_id.isnot(None)
+    )
+    student_count_stmt = select(func.count(func.distinct(models.SearchLog.user_student_id))).where(
+        models.SearchLog.user_student_id.isnot(None)
+    )
+    if filters:
+        teacher_count_stmt = teacher_count_stmt.where(*filters)
+        student_count_stmt = student_count_stmt.where(*filters)
+    unique_teacher_count = (await session.execute(teacher_count_stmt)).scalar_one()
+    unique_student_count = (await session.execute(student_count_stmt)).scalar_one()
+
+    # Top 查询关键词
+    top_stmt = (
+        select(models.SearchLog.query, func.count().label("cnt"))
+        .group_by(models.SearchLog.query)
+        .order_by(func.count().desc())
+        .limit(top_n)
+    )
+    if filters:
+        top_stmt = top_stmt.where(*filters)
+    top_rows = (await session.execute(top_stmt)).all()
+    top_queries = [{"query": q, "count": c} for q, c in top_rows]
+
+    # 按天统计（UTC 日期）
+    daily_stmt = (
+        select(func.date(models.SearchLog.created_at), func.count().label("cnt"))
+        .group_by(func.date(models.SearchLog.created_at))
+        .order_by(func.date(models.SearchLog.created_at))
+    )
+    if filters:
+        daily_stmt = daily_stmt.where(*filters)
+    daily_rows = (await session.execute(daily_stmt)).all()
+    daily = [
+        {"date": d.isoformat() if d else None, "count": c}
+        for d, c in daily_rows
+    ]
+
+    return {
+        "total_searches": total,
+        "unique_teacher_count": unique_teacher_count,
+        "unique_student_count": unique_student_count,
+        "top_queries": top_queries,
+        "daily": daily,
     }
 
 

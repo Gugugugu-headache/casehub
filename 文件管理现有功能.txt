@@ -1,0 +1,60 @@
+下面按“文件管理模块”梳理现有接口，并分别说明管理员/教师/学生能做什么。
+
+文件管理接口清单
+
+POST /documents/upload
+上传文件（学生上传进入待审核；教师/管理员上传直接通过）
+GET /documents
+文件列表（分页+筛选）
+POST /documents/search
+按文件名搜索（只返回文件列表）
+GET /documents/{id}
+文件详情（含审核记录、嵌入任务等）
+GET /documents/{id}/content
+文件内容预览/下载
+PUT /documents/{id}/rename
+重命名展示名
+DELETE /documents/{id}
+删除（可同步 MinIO/RAGFlow）
+GET /audits/pending
+待审核列表
+POST /audits/{document_id}/decision
+审核通过/拒绝
+GET /audits
+审核记录列表（仅管理员）
+GET /audits/{audit_id}
+审核详情（仅管理员）
+管理员视角
+
+上传：✅ 直接入库（approved）
+列表：✅ 可看全部状态（含 pending/rejected）
+搜索：✅ 可按文件名查
+详情：✅ 可看全部
+预览/下载：✅ 可看任何状态（含待审核）
+重命名：✅
+删除：✅
+待审核列表：✅
+审核：✅
+审核记录列表/详情：✅
+教师视角
+
+上传：✅ 直接入库（approved）
+列表：✅ 仅自己班级，默认只看 approved/embedded
+（不能看 pending/rejected）
+搜索：✅ 仅自己班级
+详情：✅ 仅自己班级，不能看 pending/rejected
+预览/下载：✅ 仅自己班级，不能看 pending/rejected
+重命名：✅ 仅自己班级
+删除：✅ 仅自己班级
+待审核列表：❌（目前无权限限制但你可前端不显示；需要的话我可以加后端限制）
+审核：❌
+审核记录列表/详情：❌
+学生视角
+
+上传：✅（进入 pending）
+列表：✅ 仅自己班级，默认只看 approved/embedded
+（不能看 pending/rejected）
+搜索：✅ 仅自己班级
+详情：✅ 仅自己班级，不能看 pending/rejected
+预览/下载：✅ 仅自己班级，不能看 pending/rejected
+重命名/删除/审核：❌
