@@ -118,6 +118,32 @@ class DeleteDocumentRequest(BaseModel):
     remove_minio: bool = True
 
 
+class CreateConversationRequest(BaseModel):
+    """创建对话请求体。"""
+
+    role: str
+    user_id: int
+    kb_id: Optional[int] = None
+    class_id: Optional[int] = None
+    class_code: Optional[str] = None
+    name: Optional[str] = None
+    model_name: Optional[str] = None
+    top_n: int = 5
+    similarity_threshold: float = 0.2
+    show_citations: bool = True
+    system_prompt: Optional[str] = None
+
+
+class SendMessageRequest(BaseModel):
+    """发送对话消息请求体。"""
+
+    role: str
+    user_id: int
+    content: str
+    stream: bool = False
+    metadata_condition: Optional[dict] = None
+
+
 # ------------------------------
 # 通用工具函数
 # ------------------------------
@@ -463,6 +489,128 @@ async def _ragflow_get_chunk(dataset_id: str, document_id: str, chunk_id: str) -
         raise HTTPException(status_code=404, detail="未找到对应数据块")
 
     return chunk
+
+
+async def _ragflow_create_chat_assistant(
+    name: str,
+    dataset_ids: List[str],
+    model_name: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    top_n: Optional[int] = None,
+    similarity_threshold: Optional[float] = None,
+) -> str:
+    """创建 RAGFlow 聊天助手，返回 chat_id。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body: Dict[str, Any] = {
+        "name": name,
+        "dataset_ids": dataset_ids,
+    }
+
+    # 可选 LLM 配置（按需传入，避免参数不兼容）
+    if model_name:
+        body["llm"] = {"model_name": model_name}
+
+    # 可选提示词配置
+    if system_prompt or top_n is not None or similarity_threshold is not None:
+        prompt: Dict[str, Any] = {}
+        if system_prompt:
+            prompt["prompt"] = system_prompt
+        if top_n is not None:
+            prompt["top_n"] = top_n
+        if similarity_threshold is not None:
+            prompt["similarity_threshold"] = similarity_threshold
+        body["prompt"] = prompt
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(f"{base_url}/api/v1/chats", json=body, headers=headers)
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 创建聊天助手失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 创建聊天助手失败: {message}")
+
+    data = payload.get("data") or {}
+    chat_id = data.get("id")
+    if not chat_id:
+        raise HTTPException(status_code=502, detail="RAGFlow 返回缺少 chat_id")
+
+    return chat_id
+
+
+async def _ragflow_create_session(chat_id: str, name: str, user_id: Optional[str]) -> str:
+    """创建 RAGFlow 会话，返回 session_id。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body: Dict[str, Any] = {"name": name}
+    if user_id:
+        body["user_id"] = user_id
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{base_url}/api/v1/chats/{chat_id}/sessions",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 创建会话失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 创建会话失败: {message}")
+
+    data = payload.get("data") or {}
+    session_id = data.get("id") or data.get("session_id")
+    if not session_id:
+        raise HTTPException(status_code=502, detail="RAGFlow 返回缺少 session_id")
+
+    return session_id
+
+
+async def _ragflow_chat_completion(
+    chat_id: str,
+    question: str,
+    session_id: Optional[str],
+    user_id: Optional[str],
+    stream: bool = False,
+    metadata_condition: Optional[dict] = None,
+) -> Dict[str, Any]:
+    """调用 RAGFlow 会话对话接口。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body: Dict[str, Any] = {
+        "question": question,
+        "stream": stream,
+    }
+    if session_id:
+        body["session_id"] = session_id
+    elif user_id:
+        body["user_id"] = user_id
+    if metadata_condition:
+        body["metadata_condition"] = metadata_condition
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{base_url}/api/v1/chats/{chat_id}/completions",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 对话失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 对话失败: {message}")
+
+    data = payload.get("data") or {}
+    return {"data": data, "raw": payload}
 
 
 async def _resolve_kb(
@@ -2185,6 +2333,355 @@ async def search_cases(
         "ragflow_dataset_id": kb.ragflow_dataset_id,
         "result_count": len(formatted),
         "chunks": formatted,
+    }
+
+
+# ------------------------------
+# 对话模块（RAGFlow 会话接口）
+# ------------------------------
+
+
+@app.post("/conversations")
+async def create_conversation(
+    payload: CreateConversationRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """创建对话（同步创建 RAGFlow 聊天助手 + 会话）。"""
+    role = payload.role.lower().strip()
+    if role not in {"teacher", "student"}:
+        raise HTTPException(status_code=403, detail="仅教师或学生可创建对话")
+
+    kb = await _resolve_kb_for_search(
+        session,
+        role,
+        payload.user_id,
+        payload.kb_id,
+        payload.class_id,
+        payload.class_code,
+    )
+
+    if not kb.ragflow_dataset_id:
+        raise HTTPException(status_code=400, detail="知识库未绑定 RAGFlow dataset")
+
+    cls = (
+        await session.execute(
+            select(models.Class).where(models.Class.id == kb.class_id)
+        )
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    name = (payload.name or "").strip()
+    if not name:
+        name = f"{cls.class_code}-对话-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+
+    # 避免 RAGFlow 聊天助手名称重复，追加短随机串作为唯一标识
+    unique_chat_name = f"{cls.class_code}-{name}-{uuid.uuid4().hex[:8]}"
+    chat_id = await _ragflow_create_chat_assistant(
+        name=unique_chat_name,
+        dataset_ids=[kb.ragflow_dataset_id],
+        model_name=payload.model_name,
+        system_prompt=payload.system_prompt,
+        top_n=payload.top_n,
+        similarity_threshold=payload.similarity_threshold,
+    )
+    session_id = await _ragflow_create_session(
+        chat_id=chat_id,
+        name=name,
+        user_id=str(payload.user_id),
+    )
+
+    conv = models.Conversation(
+        owner_teacher_id=payload.user_id if role == "teacher" else None,
+        owner_student_id=payload.user_id if role == "student" else None,
+        kb_id=kb.id,
+        ragflow_chat_id=chat_id,
+        ragflow_session_id=session_id,
+        model_name=payload.model_name,
+        top_n=payload.top_n,
+        similarity_threshold=payload.similarity_threshold,
+        show_citations=payload.show_citations,
+        system_prompt=payload.system_prompt,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(conv)
+    await session.commit()
+    await session.refresh(conv)
+
+    return {
+        "conversation_id": conv.id,
+        "ragflow_chat_id": conv.ragflow_chat_id,
+        "ragflow_session_id": conv.ragflow_session_id,
+        "kb_id": kb.id,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+        "name": name,
+        "created_at": conv.created_at,
+    }
+
+
+@app.get("/conversations")
+async def list_conversations(
+    role: str,
+    user_id: int,
+    class_id: Optional[int] = None,
+    class_code: Optional[str] = None,
+    kb_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 20,
+    session: AsyncSession = Depends(get_session),
+):
+    """对话列表（教师/学生仅看自己的）。"""
+    role = role.lower().strip()
+    if role not in {"teacher", "student"}:
+        raise HTTPException(status_code=403, detail="仅教师或学生可查看对话")
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=400, detail="分页参数不合法")
+
+    class_id = await _resolve_class_id(session, class_id, class_code)
+
+    stmt = (
+        select(models.Conversation, models.KnowledgeBase, models.Class)
+        .join(models.KnowledgeBase, models.Conversation.kb_id == models.KnowledgeBase.id)
+        .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+    )
+
+    if role == "teacher":
+        stmt = stmt.where(models.Conversation.owner_teacher_id == user_id)
+    else:
+        stmt = stmt.where(models.Conversation.owner_student_id == user_id)
+
+    if kb_id is not None:
+        stmt = stmt.where(models.Conversation.kb_id == kb_id)
+    if class_id is not None:
+        stmt = stmt.where(models.KnowledgeBase.class_id == class_id)
+
+    total_stmt = select(func.count()).select_from(stmt.subquery())
+    total = (await session.execute(total_stmt)).scalar_one()
+
+    rows = (
+        await session.execute(
+            stmt
+            .order_by(models.Conversation.updated_at.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        )
+    ).all()
+
+    items = [
+        {
+            "conversation_id": conv.id,
+            "kb_id": kb_row.id,
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+            "model_name": conv.model_name,
+            "top_n": conv.top_n,
+            "similarity_threshold": float(conv.similarity_threshold),
+            "show_citations": conv.show_citations,
+            "created_at": conv.created_at,
+            "updated_at": conv.updated_at,
+        }
+        for conv, kb_row, cls in rows
+    ]
+
+    return {
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "items": items,
+    }
+
+
+@app.get("/conversations/{conversation_id}")
+async def get_conversation_detail(
+    conversation_id: int,
+    role: str,
+    user_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """对话详情（含消息列表）。"""
+    role = role.lower().strip()
+    if role not in {"teacher", "student"}:
+        raise HTTPException(status_code=403, detail="仅教师或学生可查看对话")
+
+    row = (
+        await session.execute(
+            select(models.Conversation, models.KnowledgeBase, models.Class)
+            .join(models.KnowledgeBase, models.Conversation.kb_id == models.KnowledgeBase.id)
+            .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+            .where(models.Conversation.id == conversation_id)
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    conv, kb_row, cls = row
+    if role == "teacher" and conv.owner_teacher_id != user_id:
+        raise HTTPException(status_code=403, detail="无权查看该对话")
+    if role == "student" and conv.owner_student_id != user_id:
+        raise HTTPException(status_code=403, detail="无权查看该对话")
+
+    msg_rows = (
+        await session.execute(
+            select(models.Message)
+            .where(models.Message.conversation_id == conv.id)
+            .order_by(models.Message.created_at.asc())
+        )
+    ).scalars().all()
+
+    messages = [
+        {
+            "id": m.id,
+            "role": m.sender_role.value,
+            "content": m.content,
+            "reference": m.reference,
+            "created_at": m.created_at,
+        }
+        for m in msg_rows
+    ]
+
+    return {
+        "conversation_id": conv.id,
+        "kb_id": kb_row.id,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+        "model_name": conv.model_name,
+        "top_n": conv.top_n,
+        "similarity_threshold": float(conv.similarity_threshold),
+        "show_citations": conv.show_citations,
+        "system_prompt": conv.system_prompt,
+        "created_at": conv.created_at,
+        "updated_at": conv.updated_at,
+        "messages": messages,
+    }
+
+
+@app.post("/conversations/{conversation_id}/messages")
+async def send_conversation_message(
+    conversation_id: int,
+    payload: SendMessageRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """发送消息并调用 RAGFlow 生成回复。"""
+    role = payload.role.lower().strip()
+    if role not in {"teacher", "student"}:
+        raise HTTPException(status_code=403, detail="仅教师或学生可发送消息")
+
+    content = (payload.content or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+    conv = (
+        await session.execute(
+            select(models.Conversation).where(models.Conversation.id == conversation_id)
+        )
+    ).scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    if role == "teacher" and conv.owner_teacher_id != payload.user_id:
+        raise HTTPException(status_code=403, detail="无权操作该对话")
+    if role == "student" and conv.owner_student_id != payload.user_id:
+        raise HTTPException(status_code=403, detail="无权操作该对话")
+
+    # 记录用户消息
+    user_msg = models.Message(
+        conversation_id=conv.id,
+        sender_role=models.SenderRole.user,
+        content=content,
+        reference=None,
+        created_at=datetime.utcnow(),
+    )
+    session.add(user_msg)
+    await session.commit()
+    await session.refresh(user_msg)
+
+    # 若缺少 RAGFlow chat/session，补建
+    if not conv.ragflow_chat_id:
+        kb = (
+            await session.execute(
+                select(models.KnowledgeBase).where(models.KnowledgeBase.id == conv.kb_id)
+            )
+        ).scalar_one_or_none()
+        if not kb or not kb.ragflow_dataset_id:
+            raise HTTPException(status_code=400, detail="知识库未绑定 RAGFlow dataset")
+        chat_id = await _ragflow_create_chat_assistant(
+            name=f"kb-{kb.id}-对话",
+            dataset_ids=[kb.ragflow_dataset_id],
+            model_name=conv.model_name,
+            system_prompt=conv.system_prompt,
+            top_n=conv.top_n,
+            similarity_threshold=float(conv.similarity_threshold),
+        )
+        conv.ragflow_chat_id = chat_id
+
+    if not conv.ragflow_session_id:
+        conv.ragflow_session_id = await _ragflow_create_session(
+            chat_id=conv.ragflow_chat_id,
+            name=f"conv-{conv.id}",
+            user_id=str(payload.user_id),
+        )
+
+    ragflow_result = await _ragflow_chat_completion(
+        chat_id=conv.ragflow_chat_id,
+        question=content,
+        session_id=conv.ragflow_session_id,
+        user_id=str(payload.user_id),
+        stream=False,
+        metadata_condition=payload.metadata_condition,
+    )
+
+    data = ragflow_result.get("data") or {}
+    ragflow_session_id = data.get("session_id")
+    if ragflow_session_id:
+        conv.ragflow_session_id = ragflow_session_id
+
+    # 尽量提取回答文本
+    answer = ""
+    if isinstance(data, dict):
+        for key in ("answer", "content", "result", "response", "text"):
+            if data.get(key):
+                answer = data.get(key)
+                break
+        if not answer and isinstance(data.get("choices"), list):
+            choice = data["choices"][0] if data["choices"] else None
+            if isinstance(choice, dict):
+                msg = choice.get("message") or choice.get("delta") or {}
+                if isinstance(msg, dict) and msg.get("content"):
+                    answer = msg.get("content")
+
+    reference = None
+    if isinstance(data, dict):
+        if data.get("reference") or data.get("references"):
+            reference = data.get("reference") or data.get("references")
+        elif data.get("chunks") or data.get("doc_aggs"):
+            reference = {
+                "chunks": data.get("chunks"),
+                "doc_aggs": data.get("doc_aggs"),
+            }
+
+    assistant_msg = models.Message(
+        conversation_id=conv.id,
+        sender_role=models.SenderRole.assistant,
+        content=answer or "",
+        reference=reference,
+        created_at=datetime.utcnow(),
+    )
+    session.add(assistant_msg)
+    conv.updated_at = datetime.utcnow()
+    await session.commit()
+    await session.refresh(assistant_msg)
+
+    return {
+        "conversation_id": conv.id,
+        "user_message_id": user_msg.id,
+        "assistant_message_id": assistant_msg.id,
+        "assistant_answer": assistant_msg.content,
+        "reference": assistant_msg.reference,
     }
 
 

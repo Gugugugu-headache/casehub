@@ -291,6 +291,8 @@ class Conversation(Base):
     kb_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("knowledge_bases.id")
     )
+    ragflow_chat_id: Mapped[Optional[str]] = mapped_column(String(64))
+    ragflow_session_id: Mapped[Optional[str]] = mapped_column(String(64))
     model_name: Mapped[Optional[str]] = mapped_column(String(64))
     top_n: Mapped[int] = mapped_column(Integer, default=5)
     similarity_threshold: Mapped[float] = mapped_column(Numeric(4, 3), default=0.2)
