@@ -46,6 +46,15 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class StudentRegisterRequest(BaseModel):
+    """学生注册请求体。"""
+
+    student_no: str
+    password: str
+    class_code: str
+    name: Optional[str] = None
+
+
 class CreateClassRequest(BaseModel):
     """创建班级请求体（同步创建 RAGFlow 数据集）。"""
 
@@ -144,6 +153,46 @@ class SendMessageRequest(BaseModel):
     metadata_condition: Optional[dict] = None
 
 
+class UpdateConversationSettingsRequest(BaseModel):
+    """更新对话设置请求体。"""
+
+    role: str
+    user_id: int
+    model_name: Optional[str] = None
+    system_prompt: Optional[str] = None
+    top_n: Optional[int] = None
+    similarity_threshold: Optional[float] = None
+    show_citations: Optional[bool] = None
+    sync_ragflow: bool = True
+
+
+class RenameConversationRequest(BaseModel):
+    """重命名对话请求体。"""
+
+    role: str
+    user_id: int
+    new_name: str
+    sync_ragflow: bool = True
+    sync_session: bool = True
+
+
+class ClearConversationRequest(BaseModel):
+    """清空对话请求体。"""
+
+    role: str
+    user_id: int
+    sync_ragflow: bool = True
+    reset_session: bool = True
+
+
+class DeleteConversationRequest(BaseModel):
+    """删除对话请求体。"""
+
+    role: str
+    user_id: int
+    sync_ragflow: bool = True
+
+
 # ------------------------------
 # 通用工具函数
 # ------------------------------
@@ -160,6 +209,21 @@ def _verify_password(password: str, stored_hash: str) -> bool:
         return True
     sha256 = hashlib.sha256(password.encode("utf-8")).hexdigest()
     return stored_hash == sha256
+
+
+def _hash_password(password: str) -> str:
+    """对密码做 SHA256 摘要（注册时使用）。"""
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def _normalize_system_prompt(system_prompt: str) -> str:
+    """确保系统提示词包含 {knowledge} 占位符。"""
+    text = (system_prompt or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="system_prompt 不能为空")
+    if "{knowledge}" not in text:
+        text = f"{text}\n\n以下是知识库内容：\n{{knowledge}}"
+    return text
 
 
 async def _login_admin(payload: LoginRequest, session: AsyncSession):
@@ -312,6 +376,33 @@ async def _check_document_permission(
         return
 
     raise HTTPException(status_code=400, detail="role 参数不合法")
+
+
+async def _get_conversation_for_owner(
+    session: AsyncSession,
+    conversation_id: int,
+    role: str,
+    user_id: int,
+) -> models.Conversation:
+    """获取对话并校验归属权限。"""
+    role = role.lower().strip()
+    if role not in {"teacher", "student"}:
+        raise HTTPException(status_code=403, detail="仅教师或学生可操作对话")
+
+    conv = (
+        await session.execute(
+            select(models.Conversation).where(models.Conversation.id == conversation_id)
+        )
+    ).scalar_one_or_none()
+    if not conv:
+        raise HTTPException(status_code=404, detail="对话不存在")
+
+    if role == "teacher" and conv.owner_teacher_id != user_id:
+        raise HTTPException(status_code=403, detail="无权操作该对话")
+    if role == "student" and conv.owner_student_id != user_id:
+        raise HTTPException(status_code=403, detail="无权操作该对话")
+
+    return conv
 
 
 async def _create_ragflow_dataset(payload: CreateClassRequest) -> str:
@@ -570,6 +661,123 @@ async def _ragflow_create_session(chat_id: str, name: str, user_id: Optional[str
         raise HTTPException(status_code=502, detail="RAGFlow 返回缺少 session_id")
 
     return session_id
+
+
+async def _ragflow_update_chat_name(chat_id: str, new_name: str) -> None:
+    """同步更新 RAGFlow 聊天助手名称。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"name": new_name}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.put(
+            f"{base_url}/api/v1/chats/{chat_id}",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 对话重命名失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 对话重命名失败: {message}")
+
+
+async def _ragflow_update_session_name(chat_id: str, session_id: str, new_name: str) -> None:
+    """同步更新 RAGFlow 会话名称。"""
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"name": new_name}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.put(
+            f"{base_url}/api/v1/chats/{chat_id}/sessions/{session_id}",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 会话重命名失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 会话重命名失败: {message}")
+
+
+async def _ragflow_update_chat_settings(chat_id: str, body: Dict[str, Any]) -> None:
+    """同步更新 RAGFlow 聊天助手配置。"""
+    if not body:
+        return
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.put(
+            f"{base_url}/api/v1/chats/{chat_id}",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 更新对话设置失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 更新对话设置失败: {message}")
+
+
+async def _ragflow_delete_chats(chat_ids: List[str]) -> None:
+    """同步删除 RAGFlow 聊天助手。"""
+    if not chat_ids:
+        return
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"ids": chat_ids}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.request(
+            "DELETE",
+            f"{base_url}/api/v1/chats",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除对话失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除对话失败: {message}")
+
+
+async def _ragflow_delete_sessions(chat_id: str, session_ids: List[str]) -> None:
+    """同步删除 RAGFlow 会话。"""
+    if not session_ids:
+        return
+    base_url = str(settings.ragflow_base_url).rstrip("/")
+    headers = _ragflow_headers()
+    body = {"ids": session_ids}
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.request(
+            "DELETE",
+            f"{base_url}/api/v1/chats/{chat_id}/sessions",
+            headers=headers,
+            json=body,
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除会话失败: HTTP {resp.status_code}")
+
+    payload = resp.json()
+    if payload.get("code") != 0:
+        message = payload.get("message", "未知错误")
+        raise HTTPException(status_code=502, detail=f"RAGFlow 删除会话失败: {message}")
 
 
 async def _ragflow_chat_completion(
@@ -1065,6 +1273,73 @@ async def teacher_login(payload: LoginRequest, session: AsyncSession = Depends(g
 @app.post("/auth/student/login")
 async def student_login(payload: LoginRequest, session: AsyncSession = Depends(get_session)):
     return await _login_student(payload, session)
+
+
+@app.post("/auth/student/register")
+async def student_register(
+    payload: StudentRegisterRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """学生注册（学号 + 密码 + 班级编号 + 姓名）。"""
+    student_no = (payload.student_no or "").strip()
+    password = (payload.password or "").strip()
+    class_code = (payload.class_code or "").strip()
+    name = (payload.name or "").strip()
+
+    if not student_no or not password or not class_code or not name:
+        raise HTTPException(status_code=400, detail="学号、密码、班级编号、姓名不能为空")
+
+    cls = (
+        await session.execute(
+            select(models.Class).where(models.Class.class_code == class_code)
+        )
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    # 班级必须已绑定教师，且教师状态为启用
+    teacher = (
+        await session.execute(
+            select(models.Teacher).where(models.Teacher.id == cls.teacher_id)
+        )
+    ).scalar_one_or_none()
+    if not teacher or teacher.status != 1:
+        raise HTTPException(status_code=400, detail="班级未绑定启用教师")
+
+    exists = (
+        await session.execute(
+            select(models.Student).where(models.Student.student_no == student_no)
+        )
+    ).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=409, detail="学号已存在")
+
+    student = models.Student(
+        student_no=student_no,
+        class_id=cls.id,
+        password_hash=_hash_password(password),
+        name=name,
+        status=1,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(student)
+    try:
+        await session.commit()
+        await session.refresh(student)
+    except IntegrityError:
+        await session.rollback()
+        raise HTTPException(status_code=409, detail="学号已存在")
+
+    return {
+        "role": "student",
+        "id": student.id,
+        "student_no": student.student_no,
+        "name": student.name,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+    }
 
 
 # ------------------------------
@@ -2377,11 +2652,15 @@ async def create_conversation(
 
     # 避免 RAGFlow 聊天助手名称重复，追加短随机串作为唯一标识
     unique_chat_name = f"{cls.class_code}-{name}-{uuid.uuid4().hex[:8]}"
+    system_prompt = None
+    if payload.system_prompt is not None:
+        system_prompt = _normalize_system_prompt(payload.system_prompt)
+
     chat_id = await _ragflow_create_chat_assistant(
         name=unique_chat_name,
         dataset_ids=[kb.ragflow_dataset_id],
         model_name=payload.model_name,
-        system_prompt=payload.system_prompt,
+        system_prompt=system_prompt,
         top_n=payload.top_n,
         similarity_threshold=payload.similarity_threshold,
     )
@@ -2395,13 +2674,14 @@ async def create_conversation(
         owner_teacher_id=payload.user_id if role == "teacher" else None,
         owner_student_id=payload.user_id if role == "student" else None,
         kb_id=kb.id,
+        name=name,
         ragflow_chat_id=chat_id,
         ragflow_session_id=session_id,
         model_name=payload.model_name,
         top_n=payload.top_n,
         similarity_threshold=payload.similarity_threshold,
         show_citations=payload.show_citations,
-        system_prompt=payload.system_prompt,
+        system_prompt=system_prompt,
         created_at=datetime.utcnow(),
         updated_at=datetime.utcnow(),
     )
@@ -2417,7 +2697,7 @@ async def create_conversation(
         "class_id": cls.id,
         "class_code": cls.class_code,
         "class_name": cls.class_name,
-        "name": name,
+        "name": conv.name,
         "created_at": conv.created_at,
     }
 
@@ -2429,11 +2709,13 @@ async def list_conversations(
     class_id: Optional[int] = None,
     class_code: Optional[str] = None,
     kb_id: Optional[int] = None,
+    keyword: Optional[str] = None,
+    include_last_message: bool = False,
     page: int = 1,
     page_size: int = 20,
     session: AsyncSession = Depends(get_session),
 ):
-    """对话列表（教师/学生仅看自己的）。"""
+    """对话列表（支持班级筛选/关键词搜索）。"""
     role = role.lower().strip()
     if role not in {"teacher", "student"}:
         raise HTTPException(status_code=403, detail="仅教师或学生可查看对话")
@@ -2457,6 +2739,9 @@ async def list_conversations(
         stmt = stmt.where(models.Conversation.kb_id == kb_id)
     if class_id is not None:
         stmt = stmt.where(models.KnowledgeBase.class_id == class_id)
+    if keyword:
+        # 关键词搜索仅针对对话名称
+        stmt = stmt.where(models.Conversation.name.like(f"%{keyword.strip()}%"))
 
     total_stmt = select(func.count()).select_from(stmt.subquery())
     total = (await session.execute(total_stmt)).scalar_one()
@@ -2470,9 +2755,29 @@ async def list_conversations(
         )
     ).all()
 
+    # 可选：补充每个对话的最后一条消息（用于列表预览）
+    last_message_map: Dict[int, Dict[str, Any]] = {}
+    if include_last_message and rows:
+        conv_ids = [conv.id for conv, _, _ in rows]
+        msg_rows = (
+            await session.execute(
+                select(models.Message)
+                .where(models.Message.conversation_id.in_(conv_ids))
+                .order_by(models.Message.conversation_id, models.Message.created_at.desc())
+            )
+        ).scalars().all()
+        for msg in msg_rows:
+            if msg.conversation_id not in last_message_map:
+                last_message_map[msg.conversation_id] = {
+                    "role": msg.sender_role.value,
+                    "content": msg.content,
+                    "created_at": msg.created_at,
+                }
+
     items = [
         {
             "conversation_id": conv.id,
+            "name": conv.name or f"对话-{conv.id}",
             "kb_id": kb_row.id,
             "class_id": cls.id,
             "class_code": cls.class_code,
@@ -2483,6 +2788,7 @@ async def list_conversations(
             "show_citations": conv.show_citations,
             "created_at": conv.created_at,
             "updated_at": conv.updated_at,
+            "last_message": last_message_map.get(conv.id),
         }
         for conv, kb_row, cls in rows
     ]
@@ -2545,6 +2851,7 @@ async def get_conversation_detail(
 
     return {
         "conversation_id": conv.id,
+        "name": conv.name or f"对话-{conv.id}",
         "kb_id": kb_row.id,
         "class_id": cls.id,
         "class_code": cls.class_code,
@@ -2683,6 +2990,173 @@ async def send_conversation_message(
         "assistant_answer": assistant_msg.content,
         "reference": assistant_msg.reference,
     }
+
+
+@app.put("/conversations/{conversation_id}/settings")
+async def update_conversation_settings(
+    conversation_id: int,
+    payload: UpdateConversationSettingsRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """更新对话设置（模型/提示词/检索参数等）。"""
+    conv = await _get_conversation_for_owner(
+        session, conversation_id, payload.role, payload.user_id
+    )
+
+    # 同步 RAGFlow 配置（可选）
+    normalized_prompt = None
+    if payload.system_prompt is not None:
+        normalized_prompt = _normalize_system_prompt(payload.system_prompt)
+
+    if payload.sync_ragflow and conv.ragflow_chat_id:
+        body: Dict[str, Any] = {}
+        if payload.model_name:
+            body["llm"] = {"model_name": payload.model_name}
+
+        prompt: Dict[str, Any] = {}
+        if normalized_prompt is not None:
+            prompt["system"] = normalized_prompt
+        if payload.top_n is not None:
+            prompt["top_n"] = payload.top_n
+        if payload.similarity_threshold is not None:
+            prompt["similarity_threshold"] = payload.similarity_threshold
+        if payload.show_citations is not None:
+            # RAGFlow 使用 quote/show_quote 控制引用显示
+            prompt["quote"] = bool(payload.show_citations)
+        if prompt:
+            body["prompt"] = prompt
+
+        await _ragflow_update_chat_settings(conv.ragflow_chat_id, body)
+
+    # 更新本地配置（即使不同步 RAGFlow 也会生效）
+    if payload.model_name is not None:
+        conv.model_name = payload.model_name
+    if normalized_prompt is not None:
+        conv.system_prompt = normalized_prompt
+    if payload.top_n is not None:
+        conv.top_n = payload.top_n
+    if payload.similarity_threshold is not None:
+        conv.similarity_threshold = payload.similarity_threshold
+    if payload.show_citations is not None:
+        conv.show_citations = payload.show_citations
+
+    conv.updated_at = datetime.utcnow()
+    await session.commit()
+
+    return {
+        "conversation_id": conv.id,
+        "name": conv.name or f"对话-{conv.id}",
+        "model_name": conv.model_name,
+        "top_n": conv.top_n,
+        "similarity_threshold": float(conv.similarity_threshold),
+        "show_citations": conv.show_citations,
+        "system_prompt": conv.system_prompt,
+        "updated_at": conv.updated_at,
+    }
+
+
+@app.put("/conversations/{conversation_id}/rename")
+async def rename_conversation(
+    conversation_id: int,
+    payload: RenameConversationRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """重命名对话（可同步到 RAGFlow）。"""
+    new_name = (payload.new_name or "").strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="新名称不能为空")
+
+    conv = await _get_conversation_for_owner(
+        session, conversation_id, payload.role, payload.user_id
+    )
+
+    # 先同步 RAGFlow，避免本地成功但远端失败
+    if payload.sync_ragflow and conv.ragflow_chat_id:
+        await _ragflow_update_chat_name(conv.ragflow_chat_id, new_name)
+        if payload.sync_session and conv.ragflow_session_id:
+            await _ragflow_update_session_name(
+                conv.ragflow_chat_id, conv.ragflow_session_id, new_name
+            )
+
+    conv.name = new_name
+    conv.updated_at = datetime.utcnow()
+    await session.commit()
+
+    return {
+        "conversation_id": conv.id,
+        "name": conv.name,
+        "updated_at": conv.updated_at,
+    }
+
+
+@app.post("/conversations/{conversation_id}/clear")
+async def clear_conversation(
+    conversation_id: int,
+    payload: ClearConversationRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """清空对话消息（可重置 RAGFlow 会话）。"""
+    conv = await _get_conversation_for_owner(
+        session, conversation_id, payload.role, payload.user_id
+    )
+
+    # 清空本地消息
+    await session.execute(
+        delete(models.Message).where(models.Message.conversation_id == conv.id)
+    )
+
+    new_session_id = None
+    if payload.reset_session:
+        if payload.sync_ragflow and conv.ragflow_chat_id:
+            # 删除旧会话，避免历史干扰
+            if conv.ragflow_session_id:
+                await _ragflow_delete_sessions(
+                    conv.ragflow_chat_id, [conv.ragflow_session_id]
+                )
+            # 重新创建会话
+            new_session_id = await _ragflow_create_session(
+                chat_id=conv.ragflow_chat_id,
+                name=conv.name or f"conv-{conv.id}",
+                user_id=str(payload.user_id),
+            )
+            conv.ragflow_session_id = new_session_id
+        else:
+            # 不同步 RAGFlow：清空后让下次发送消息自动重建会话
+            conv.ragflow_session_id = None
+
+    conv.updated_at = datetime.utcnow()
+    await session.commit()
+
+    return {
+        "conversation_id": conv.id,
+        "cleared": True,
+        "ragflow_session_id": conv.ragflow_session_id,
+        "updated_at": conv.updated_at,
+    }
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: int,
+    payload: DeleteConversationRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """删除对话（可同步删除 RAGFlow 聊天助手）。"""
+    conv = await _get_conversation_for_owner(
+        session, conversation_id, payload.role, payload.user_id
+    )
+
+    if payload.sync_ragflow and conv.ragflow_chat_id:
+        await _ragflow_delete_chats([conv.ragflow_chat_id])
+
+    # 删除本地消息与对话记录
+    await session.execute(
+        delete(models.Message).where(models.Message.conversation_id == conv.id)
+    )
+    await session.delete(conv)
+    await session.commit()
+
+    return {"conversation_id": conversation_id, "deleted": True}
 
 
 @app.get("/search/logs")

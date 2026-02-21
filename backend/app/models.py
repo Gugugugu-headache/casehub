@@ -291,6 +291,7 @@ class Conversation(Base):
     kb_id: Mapped[Optional[int]] = mapped_column(
         BigInteger, ForeignKey("knowledge_bases.id")
     )
+    name: Mapped[Optional[str]] = mapped_column(String(128))  # 对话显示名称
     ragflow_chat_id: Mapped[Optional[str]] = mapped_column(String(64))
     ragflow_session_id: Mapped[Optional[str]] = mapped_column(String(64))
     model_name: Mapped[Optional[str]] = mapped_column(String(64))
