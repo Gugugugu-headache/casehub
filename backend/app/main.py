@@ -1,5 +1,6 @@
 ﻿from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, or_, func, delete
 from sqlalchemy.exc import IntegrityError
@@ -23,6 +24,20 @@ from app import models
 
 settings = get_settings()
 app = FastAPI(title="CaseHub API", version="0.1.0")
+
+# 允许前端跨域访问（本地开发/容器访问）
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:8081",
+        "http://127.0.0.1:8081",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
