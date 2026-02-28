@@ -70,6 +70,71 @@ class StudentRegisterRequest(BaseModel):
     name: Optional[str] = None
 
 
+class AdminCreateTeacherRequest(BaseModel):
+    """管理员创建教师请求体。"""
+
+    admin_id: int
+    teacher_no: str
+    name: str
+    password: str
+    email: Optional[str] = None
+    status: int = 1
+
+
+class AdminUpdateTeacherRequest(BaseModel):
+    """管理员更新教师请求体。"""
+
+    admin_id: int
+    name: Optional[str] = None
+    password: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[int] = None
+
+
+class AdminCreateStudentRequest(BaseModel):
+    """管理员创建学生请求体。"""
+
+    admin_id: int
+    student_no: str
+    name: str
+    password: str
+    class_code: str
+    email: Optional[str] = None
+    status: int = 1
+
+
+class AdminUpdateStudentRequest(BaseModel):
+    """管理员更新学生请求体。"""
+
+    admin_id: int
+    name: Optional[str] = None
+    password: Optional[str] = None
+    class_code: Optional[str] = None
+    email: Optional[str] = None
+    status: Optional[int] = None
+
+
+class AdminCreateClassRequest(BaseModel):
+    """管理员创建班级请求体。"""
+
+    admin_id: int
+    class_code: str
+    class_name: str
+    teacher_no: str
+    embedding_model: str
+    description: Optional[str] = None
+    chunk_method: str = "table"
+    permission: str = "me"
+
+
+class AdminUpdateClassRequest(BaseModel):
+    """管理员更新班级请求体。"""
+
+    admin_id: int
+    class_name: Optional[str] = None
+    teacher_no: Optional[str] = None
+
+
 class CreateClassRequest(BaseModel):
     """创建班级请求体（同步创建 RAGFlow 数据集）。"""
 
@@ -229,6 +294,18 @@ def _verify_password(password: str, stored_hash: str) -> bool:
 def _hash_password(password: str) -> str:
     """对密码做 SHA256 摘要（注册时使用）。"""
     return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+async def _require_admin(session: AsyncSession, admin_id: int) -> models.Admin:
+    """校验管理员权限。"""
+    admin = (
+        await session.execute(
+            select(models.Admin).where(models.Admin.id == admin_id)
+        )
+    ).scalar_one_or_none()
+    if not admin or admin.status != 1:
+        raise HTTPException(status_code=403, detail="管理员不存在或已停用")
+    return admin
 
 
 def _normalize_system_prompt(system_prompt: str) -> str:
@@ -391,6 +468,53 @@ async def _check_document_permission(
         return
 
     raise HTTPException(status_code=400, detail="role 参数不合法")
+
+
+async def _get_uploader_info(
+    session: AsyncSession,
+    doc: models.Document,
+) -> Optional[Dict[str, Any]]:
+    """获取文档上传人信息（角色/编号/姓名）。"""
+    if doc.uploader_student_id:
+        student = (
+            await session.execute(
+                select(models.Student).where(models.Student.id == doc.uploader_student_id)
+            )
+        ).scalar_one_or_none()
+        if student:
+            return {
+                "role": "student",
+                "id": student.id,
+                "no": student.student_no,
+                "name": student.name,
+            }
+    if doc.uploader_teacher_id:
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.id == doc.uploader_teacher_id)
+            )
+        ).scalar_one_or_none()
+        if teacher:
+            return {
+                "role": "teacher",
+                "id": teacher.id,
+                "no": teacher.teacher_no,
+                "name": teacher.name,
+            }
+    if doc.uploader_admin_id:
+        admin = (
+            await session.execute(
+                select(models.Admin).where(models.Admin.id == doc.uploader_admin_id)
+            )
+        ).scalar_one_or_none()
+        if admin:
+            return {
+                "role": "admin",
+                "id": admin.id,
+                "no": admin.admin_no,
+                "name": admin.name,
+            }
+    return None
 
 
 async def _get_conversation_for_owner(
@@ -1358,6 +1482,492 @@ async def student_register(
 
 
 # ------------------------------
+# 管理员：用户管理
+# ------------------------------
+
+
+@app.get("/admin/teachers")
+async def list_teachers(
+    admin_id: int,
+    keyword: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员查看教师列表。"""
+    await _require_admin(session, admin_id)
+    stmt = select(models.Teacher)
+    if keyword:
+        kw = keyword.strip()
+        stmt = stmt.where(
+            or_(
+                models.Teacher.teacher_no.like(f"%{kw}%"),
+                models.Teacher.name.like(f"%{kw}%"),
+            )
+        )
+    rows = (await session.execute(stmt.order_by(models.Teacher.id.desc()))).scalars().all()
+    return [
+        {
+            "id": t.id,
+            "teacher_no": t.teacher_no,
+            "name": t.name,
+            "email": t.email,
+            "status": t.status,
+            "created_at": t.created_at,
+        }
+        for t in rows
+    ]
+
+
+@app.post("/admin/teachers")
+async def create_teacher(
+    payload: AdminCreateTeacherRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员创建教师。"""
+    await _require_admin(session, payload.admin_id)
+    teacher_no = payload.teacher_no.strip()
+    name = payload.name.strip()
+    password = payload.password.strip()
+    if not teacher_no or not name or not password:
+        raise HTTPException(status_code=400, detail="工号、姓名、密码不能为空")
+
+    exists = (
+        await session.execute(
+            select(models.Teacher).where(models.Teacher.teacher_no == teacher_no)
+        )
+    ).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=409, detail="教师工号已存在")
+
+    teacher = models.Teacher(
+        teacher_no=teacher_no,
+        name=name,
+        password_hash=_hash_password(password),
+        email=payload.email,
+        status=payload.status,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(teacher)
+    await session.commit()
+    await session.refresh(teacher)
+    return {
+        "id": teacher.id,
+        "teacher_no": teacher.teacher_no,
+        "name": teacher.name,
+        "email": teacher.email,
+        "status": teacher.status,
+    }
+
+
+@app.put("/admin/teachers/{teacher_id}")
+async def update_teacher(
+    teacher_id: int,
+    payload: AdminUpdateTeacherRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员更新教师信息。"""
+    await _require_admin(session, payload.admin_id)
+    teacher = (
+        await session.execute(
+            select(models.Teacher).where(models.Teacher.id == teacher_id)
+        )
+    ).scalar_one_or_none()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="教师不存在")
+
+    if payload.name is not None:
+        teacher.name = payload.name.strip()
+    if payload.password:
+        teacher.password_hash = _hash_password(payload.password.strip())
+    if payload.email is not None:
+        teacher.email = payload.email
+    if payload.status is not None:
+        teacher.status = payload.status
+
+    teacher.updated_at = datetime.utcnow()
+    await session.commit()
+    return {"id": teacher.id, "updated": True}
+
+
+@app.delete("/admin/teachers/{teacher_id}")
+async def delete_teacher(
+    teacher_id: int,
+    admin_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员删除教师（有班级关联时拒绝）。"""
+    await _require_admin(session, admin_id)
+    teacher = (
+        await session.execute(
+            select(models.Teacher).where(models.Teacher.id == teacher_id)
+        )
+    ).scalar_one_or_none()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="教师不存在")
+
+    class_exists = (
+        await session.execute(
+            select(models.Class).where(models.Class.teacher_id == teacher.id)
+        )
+    ).scalar_one_or_none()
+    if class_exists:
+        raise HTTPException(status_code=400, detail="教师仍绑定班级，无法删除")
+
+    await session.delete(teacher)
+    await session.commit()
+    return {"id": teacher_id, "deleted": True}
+
+
+@app.get("/admin/students")
+async def list_students(
+    admin_id: int,
+    class_code: Optional[str] = None,
+    keyword: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员查看学生列表。"""
+    await _require_admin(session, admin_id)
+    stmt = (
+        select(models.Student, models.Class)
+        .join(models.Class, models.Student.class_id == models.Class.id)
+    )
+    if class_code:
+        stmt = stmt.where(models.Class.class_code == class_code.strip())
+    if keyword:
+        kw = keyword.strip()
+        stmt = stmt.where(
+            or_(
+                models.Student.student_no.like(f"%{kw}%"),
+                models.Student.name.like(f"%{kw}%"),
+            )
+        )
+    rows = (await session.execute(stmt.order_by(models.Student.id.desc()))).all()
+    return [
+        {
+            "id": stu.id,
+            "student_no": stu.student_no,
+            "name": stu.name,
+            "email": stu.email,
+            "status": stu.status,
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+        }
+        for stu, cls in rows
+    ]
+
+
+@app.post("/admin/students")
+async def create_student(
+    payload: AdminCreateStudentRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员创建学生。"""
+    await _require_admin(session, payload.admin_id)
+    student_no = payload.student_no.strip()
+    name = payload.name.strip()
+    password = payload.password.strip()
+    class_code = payload.class_code.strip()
+    if not student_no or not name or not password or not class_code:
+        raise HTTPException(status_code=400, detail="学号、姓名、密码、班级编号不能为空")
+
+    cls = (
+        await session.execute(
+            select(models.Class).where(models.Class.class_code == class_code)
+        )
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    exists = (
+        await session.execute(
+            select(models.Student).where(models.Student.student_no == student_no)
+        )
+    ).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=409, detail="学号已存在")
+
+    student = models.Student(
+        student_no=student_no,
+        class_id=cls.id,
+        name=name,
+        password_hash=_hash_password(password),
+        email=payload.email,
+        status=payload.status,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(student)
+    await session.commit()
+    await session.refresh(student)
+    return {
+        "id": student.id,
+        "student_no": student.student_no,
+        "name": student.name,
+        "class_id": cls.id,
+        "class_code": cls.class_code,
+        "class_name": cls.class_name,
+        "status": student.status,
+    }
+
+
+@app.put("/admin/students/{student_id}")
+async def update_student(
+    student_id: int,
+    payload: AdminUpdateStudentRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员更新学生信息。"""
+    await _require_admin(session, payload.admin_id)
+    student = (
+        await session.execute(
+            select(models.Student).where(models.Student.id == student_id)
+        )
+    ).scalar_one_or_none()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+
+    if payload.class_code:
+        cls = (
+            await session.execute(
+                select(models.Class).where(models.Class.class_code == payload.class_code.strip())
+            )
+        ).scalar_one_or_none()
+        if not cls:
+            raise HTTPException(status_code=404, detail="班级不存在")
+        student.class_id = cls.id
+
+    if payload.name is not None:
+        student.name = payload.name.strip()
+    if payload.password:
+        student.password_hash = _hash_password(payload.password.strip())
+    if payload.email is not None:
+        student.email = payload.email
+    if payload.status is not None:
+        student.status = payload.status
+
+    student.updated_at = datetime.utcnow()
+    await session.commit()
+    return {"id": student.id, "updated": True}
+
+
+@app.delete("/admin/students/{student_id}")
+async def delete_student(
+    student_id: int,
+    admin_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员删除学生。"""
+    await _require_admin(session, admin_id)
+    student = (
+        await session.execute(
+            select(models.Student).where(models.Student.id == student_id)
+        )
+    ).scalar_one_or_none()
+    if not student:
+        raise HTTPException(status_code=404, detail="学生不存在")
+    await session.delete(student)
+    await session.commit()
+    return {"id": student_id, "deleted": True}
+
+
+# ------------------------------
+# 管理员：班级管理
+# ------------------------------
+
+
+@app.get("/admin/classes")
+async def list_classes_admin(
+    admin_id: int,
+    keyword: Optional[str] = None,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员查看班级列表。"""
+    await _require_admin(session, admin_id)
+    stmt = (
+        select(models.Class, models.Teacher)
+        .join(models.Teacher, models.Class.teacher_id == models.Teacher.id)
+    )
+    if keyword:
+        kw = keyword.strip()
+        stmt = stmt.where(
+            or_(
+                models.Class.class_code.like(f"%{kw}%"),
+                models.Class.class_name.like(f"%{kw}%"),
+                models.Teacher.teacher_no.like(f"%{kw}%"),
+            )
+        )
+    rows = (await session.execute(stmt.order_by(models.Class.id.desc()))).all()
+    return [
+        {
+            "class_id": cls.id,
+            "class_code": cls.class_code,
+            "class_name": cls.class_name,
+            "teacher_id": teacher.id,
+            "teacher_no": teacher.teacher_no,
+            "teacher_name": teacher.name,
+        }
+        for cls, teacher in rows
+    ]
+
+
+@app.post("/admin/classes")
+async def create_class_admin(
+    payload: AdminCreateClassRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员创建班级并同步创建 RAGFlow 数据集。"""
+    await _require_admin(session, payload.admin_id)
+
+    teacher = (
+        await session.execute(
+            select(models.Teacher).where(models.Teacher.teacher_no == payload.teacher_no)
+        )
+    ).scalar_one_or_none()
+    if not teacher:
+        raise HTTPException(status_code=404, detail="教师不存在")
+
+    exists = (
+        await session.execute(
+            select(models.Class).where(models.Class.class_code == payload.class_code)
+        )
+    ).scalar_one_or_none()
+    if exists:
+        raise HTTPException(status_code=409, detail="班级编号已存在")
+
+    dataset_id = await _create_ragflow_dataset(
+        CreateClassRequest(
+            class_code=payload.class_code,
+            class_name=payload.class_name,
+            teacher_no=payload.teacher_no,
+            embedding_model=payload.embedding_model,
+            description=payload.description,
+            chunk_method=payload.chunk_method,
+            permission=payload.permission,
+        )
+    )
+
+    new_class = models.Class(
+        class_code=payload.class_code,
+        class_name=payload.class_name,
+        teacher_id=teacher.id,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(new_class)
+    await session.commit()
+    await session.refresh(new_class)
+
+    kb = models.KnowledgeBase(
+        class_id=new_class.id,
+        name=f"{payload.class_name}知识库",
+        description=payload.description or "",
+        ragflow_dataset_id=dataset_id,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    session.add(kb)
+    await session.commit()
+
+    return {
+        "class_id": new_class.id,
+        "class_code": new_class.class_code,
+        "class_name": new_class.class_name,
+        "teacher_id": teacher.id,
+        "teacher_no": teacher.teacher_no,
+        "teacher_name": teacher.name,
+        "kb_id": kb.id,
+        "ragflow_dataset_id": kb.ragflow_dataset_id,
+    }
+
+
+@app.put("/admin/classes/{class_id}")
+async def update_class_admin(
+    class_id: int,
+    payload: AdminUpdateClassRequest,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员更新班级信息。"""
+    await _require_admin(session, payload.admin_id)
+    cls = (
+        await session.execute(
+            select(models.Class).where(models.Class.id == class_id)
+        )
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    if payload.class_name is not None:
+        cls.class_name = payload.class_name.strip()
+        kb = (
+            await session.execute(
+                select(models.KnowledgeBase).where(models.KnowledgeBase.class_id == cls.id)
+            )
+        ).scalar_one_or_none()
+        if kb:
+            kb.name = f"{cls.class_name}知识库"
+            kb.updated_at = datetime.utcnow()
+
+    if payload.teacher_no is not None:
+        teacher = (
+            await session.execute(
+                select(models.Teacher).where(models.Teacher.teacher_no == payload.teacher_no.strip())
+            )
+        ).scalar_one_or_none()
+        if not teacher:
+            raise HTTPException(status_code=404, detail="教师不存在")
+        cls.teacher_id = teacher.id
+
+    cls.updated_at = datetime.utcnow()
+    await session.commit()
+    return {"class_id": cls.id, "updated": True}
+
+
+@app.delete("/admin/classes/{class_id}")
+async def delete_class_admin(
+    class_id: int,
+    admin_id: int,
+    session: AsyncSession = Depends(get_session),
+):
+    """管理员删除班级（有学生或文件时拒绝）。"""
+    await _require_admin(session, admin_id)
+    cls = (
+        await session.execute(
+            select(models.Class).where(models.Class.id == class_id)
+        )
+    ).scalar_one_or_none()
+    if not cls:
+        raise HTTPException(status_code=404, detail="班级不存在")
+
+    student_exists = (
+        await session.execute(
+            select(models.Student).where(models.Student.class_id == cls.id)
+        )
+    ).scalar_one_or_none()
+    if student_exists:
+        raise HTTPException(status_code=400, detail="班级下仍有学生，无法删除")
+
+    kb = (
+        await session.execute(
+            select(models.KnowledgeBase).where(models.KnowledgeBase.class_id == cls.id)
+        )
+    ).scalar_one_or_none()
+    if kb:
+        doc_exists = (
+            await session.execute(
+                select(models.Document).where(models.Document.kb_id == kb.id)
+            )
+        ).scalar_one_or_none()
+        if doc_exists:
+            raise HTTPException(status_code=400, detail="知识库仍有文件，无法删除")
+        await session.delete(kb)
+
+    await session.delete(cls)
+    await session.commit()
+    return {"class_id": class_id, "deleted": True}
+
+
+# ------------------------------
 # 班级创建（同步创建 RAGFlow 数据集）
 # ------------------------------
 
@@ -2136,7 +2746,12 @@ async def list_pending_audits(
     session: AsyncSession = Depends(get_session),
 ):
     """查询待审核文件列表。"""
-    stmt = select(models.Document).where(models.Document.status == models.DocumentStatus.pending)
+    stmt = (
+        select(models.Document, models.KnowledgeBase, models.Class)
+        .join(models.KnowledgeBase, models.Document.kb_id == models.KnowledgeBase.id)
+        .join(models.Class, models.KnowledgeBase.class_id == models.Class.id)
+        .where(models.Document.status == models.DocumentStatus.pending)
+    )
 
     if class_id is None and class_code is not None:
         cls = (
@@ -2148,25 +2763,28 @@ async def list_pending_audits(
             class_id = cls.id
 
     if class_id is not None:
-        stmt = stmt.where(
-            models.Document.kb_id.in_(
-                select(models.KnowledgeBase.id).where(models.KnowledgeBase.class_id == class_id)
-            )
-        )
+        stmt = stmt.where(models.Class.id == class_id)
 
-    rows = (await session.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": d.id,
-            "kb_id": d.kb_id,
-            "original_name": d.original_name,
-            "uploader_student_id": d.uploader_student_id,
-            "uploader_teacher_id": d.uploader_teacher_id,
-            "uploader_admin_id": d.uploader_admin_id,
-            "uploaded_at": d.uploaded_at,
-        }
-        for d in rows
-    ]
+    rows = (await session.execute(stmt)).all()
+    results = []
+    for doc, kb_row, cls in rows:
+        uploader = await _get_uploader_info(session, doc)
+        results.append(
+            {
+                "id": doc.id,
+                "kb_id": doc.kb_id,
+                "class_id": cls.id,
+                "class_code": cls.class_code,
+                "class_name": cls.class_name,
+                "original_name": doc.original_name,
+                "uploader": uploader,
+                "uploader_student_id": doc.uploader_student_id,
+                "uploader_teacher_id": doc.uploader_teacher_id,
+                "uploader_admin_id": doc.uploader_admin_id,
+                "uploaded_at": doc.uploaded_at,
+            }
+        )
+    return results
 
 
 @app.get("/audits")
@@ -2245,28 +2863,31 @@ async def list_audits(
         )
     ).all()
 
-    items = [
-        {
-            "audit_id": audit.id,
-            "document_id": doc.id,
-            "document_name": doc.original_name,
-            "document_status": doc.status.value,
-            "decision": audit.decision.value,
-            "reason": audit.reason,
-            "decided_at": audit.decided_at,
-            "reviewer_admin_id": reviewer.id,
-            "reviewer_admin_name": reviewer.name,
-            "kb_id": kb.id,
-            "class_id": cls.id,
-            "class_code": cls.class_code,
-            "class_name": cls.class_name,
-            "uploader_student_id": doc.uploader_student_id,
-            "uploader_teacher_id": doc.uploader_teacher_id,
-            "uploader_admin_id": doc.uploader_admin_id,
-            "uploaded_at": doc.uploaded_at,
-        }
-        for audit, doc, kb, cls, reviewer in rows
-    ]
+    items = []
+    for audit, doc, kb, cls, reviewer in rows:
+        uploader = await _get_uploader_info(session, doc)
+        items.append(
+            {
+                "audit_id": audit.id,
+                "document_id": doc.id,
+                "document_name": doc.original_name,
+                "document_status": doc.status.value,
+                "decision": audit.decision.value,
+                "reason": audit.reason,
+                "decided_at": audit.decided_at,
+                "reviewer_admin_id": reviewer.id,
+                "reviewer_admin_name": reviewer.name,
+                "kb_id": kb.id,
+                "class_id": cls.id,
+                "class_code": cls.class_code,
+                "class_name": cls.class_name,
+                "uploader": uploader,
+                "uploader_student_id": doc.uploader_student_id,
+                "uploader_teacher_id": doc.uploader_teacher_id,
+                "uploader_admin_id": doc.uploader_admin_id,
+                "uploaded_at": doc.uploaded_at,
+            }
+        )
 
     return {
         "page": page,
