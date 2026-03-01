@@ -348,7 +348,7 @@
 
       <div class="form-row">
         <label>上传文件（Excel）</label>
-        <input type="file" accept=".xlsx,.xls" @change="onFileChange" />
+        <input ref="fileInput" type="file" accept=".xlsx,.xls" @change="onFileChange" />
       </div>
       <div class="detail-actions">
         <button class="btn light" @click="uploadFile">上传到班级知识库</button>
@@ -459,6 +459,7 @@ const selectedFileId = ref<number | null>(null);
 const selectedFile = ref<any | null>(null);
 const fileRename = ref("");
 const fileToUpload = ref<File | null>(null);
+const fileInput = ref<HTMLInputElement | null>(null);
 
 const adminId = computed(() => auth?.id || 0);
 const apiBase = getApiBase();
@@ -917,6 +918,9 @@ const uploadFile = async () => {
       throw new Error(data.detail || `文件上传失败: ${resp.status}`);
     }
     fileToUpload.value = null;
+    if (fileInput.value) {
+      fileInput.value.value = "";
+    }
     await loadFiles();
   } catch (err: any) {
     errorMessage.value = err.message || "文件上传失败";
@@ -983,6 +987,20 @@ watch(userTab, () => {
 watch(studentClassFilter, () => {
   if (section.value === "users" && userTab.value === "student") {
     loadStudents();
+  }
+});
+
+watch(fileClassCode, () => {
+  if (section.value !== "files") return;
+  if (fileClassCode.value.trim()) {
+    fileKeyword.value = "";
+    loadFiles();
+  } else {
+    fileKeyword.value = "";
+    fileRows.value = [];
+    selectedFileId.value = null;
+    selectedFile.value = null;
+    fileRename.value = "";
   }
 });
 

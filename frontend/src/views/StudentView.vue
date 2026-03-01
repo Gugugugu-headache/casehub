@@ -28,18 +28,18 @@
       <aside class="panel list-panel">
         <div class="panel-header">
           <div>
-            <h2>对话列表</h2>
+            <h2>会话列表</h2>
             <p class="muted">按班级或关键词过滤会话。</p>
           </div>
           <div class="panel-actions">
-            <input v-model="keyword" placeholder="搜索对话名称" />
+            <input v-model="keyword" placeholder="搜索会话名称" />
             <button class="btn ghost" @click="refreshConversations">搜索</button>
           </div>
         </div>
 
         <div class="new-conversation">
-          <input v-model="newConversationName" placeholder="新对话名称（可选）" />
-          <button class="btn light" @click="createConversation">新增对话</button>
+          <input v-model="newConversationName" placeholder="新会话名称（可选）" />
+          <button class="btn light" @click="createConversation">新增会话</button>
         </div>
 
         <div class="list">
@@ -65,20 +65,20 @@
       <section class="panel conversation-panel">
         <div class="panel-header">
           <div>
-            <h2>{{ activeConversation?.name || "请选择对话" }}</h2>
+            <h2>{{ activeConversation?.name || "请选择会话" }}</h2>
             <p class="muted" v-if="activeConversation">
-              班级：{{ activeConversation.class_code }}｜{{ activeConversation.class_name }}
+              班级：{{ activeConversation.class_code }} - {{ activeConversation.class_name }}
             </p>
           </div>
           <div class="panel-actions">
-            <input v-model="renameValue" placeholder="新的对话名称" />
+            <input v-model="renameValue" placeholder="新的会话名称" />
             <button class="btn light" @click="renameConversation">重命名</button>
             <button class="btn ghost" @click="clearConversation">清空</button>
             <button class="btn danger" @click="deleteConversation">删除</button>
           </div>
         </div>
 
-        <div class="messages">
+        <div ref="messagesRef" class="messages">
           <div v-if="!messages.length" class="empty">
             还没有消息，发送一条开始对话吧。
           </div>
@@ -86,30 +86,37 @@
             v-for="msg in messages"
             :key="msg.id"
             class="bubble"
-            :class="msg.role"
+            :class="[msg.role, msg.pending ? 'pending' : '']"
           >
             <div class="bubble-role">{{ roleMap[msg.role] }}</div>
-            <div class="bubble-content">{{ msg.content }}</div>
+            <div class="bubble-content">
+              {{ msg.content }}
+              <span v-if="msg.pending" class="pending-dot">•</span>
+              <span v-if="msg.pending" class="pending-dot">•</span>
+              <span v-if="msg.pending" class="pending-dot">•</span>
+            </div>
           </div>
         </div>
 
         <div class="composer">
-          <textarea v-model="draftMessage" placeholder="输入你的问题..." />
-          <button class="btn primary" @click="sendMessage">发送</button>
+          <textarea v-model="draftMessage" placeholder="输入你的问题..." :disabled="isSending" />
+          <button class="btn primary" @click="sendMessage" :disabled="isSending">
+            {{ isSending ? "发送中..." : "发送" }}
+          </button>
         </div>
       </section>
 
       <aside class="panel settings-panel">
         <div class="panel-header">
           <div>
-            <h2>对话设置</h2>
+            <h2>会话设置</h2>
             <p class="muted">学生仅支持提示词与检索参数。</p>
           </div>
         </div>
         <div class="form-row">
-          <label>系统提示词</label>
+          <label>系统提示语</label>
           <textarea v-model="settings.systemPrompt" placeholder="请用要点回答" />
-          <p class="helper">系统会自动补充 {knowledge} 占位符。</p>
+          <p class="helper">系统会自动补全 {knowledge} 占位符。</p>
         </div>
         <div class="form-row">
           <label>Top-N</label>
@@ -134,13 +141,13 @@
     </section>
 
     <footer class="footer">
-      <span>提示：学生只能访问本班级知识库。</span>
+      <span>提示：学生仅能访问本班级知识库。</span>
     </footer>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, nextTick, ref } from "vue";
 import { useRouter } from "vue-router";
 import { request } from "../services/api";
 import { clearAuth, getAuth } from "../services/auth";
@@ -164,6 +171,7 @@ interface MessageItem {
   role: "user" | "assistant" | "system";
   content: string;
   created_at: string;
+  pending?: boolean;
 }
 
 const router = useRouter();
@@ -177,6 +185,8 @@ const messages = ref<MessageItem[]>([]);
 const draftMessage = ref("");
 const renameValue = ref("");
 const errorMessage = ref("");
+const isSending = ref(false);
+const messagesRef = ref<HTMLElement | null>(null);
 
 const settings = ref({
   systemPrompt: "",
@@ -186,7 +196,7 @@ const settings = ref({
 });
 
 const roleMap: Record<string, string> = {
-  user: "你",
+  user: "用户",
   assistant: "助手",
   system: "系统",
 };
@@ -199,6 +209,13 @@ const formatTime = (value?: string) => {
   if (!value) return "";
   const dt = new Date(value);
   return dt.toLocaleString();
+};
+
+const scrollToBottom = async () => {
+  await nextTick();
+  if (messagesRef.value) {
+    messagesRef.value.scrollTop = messagesRef.value.scrollHeight;
+  }
 };
 
 const logout = () => {
@@ -232,7 +249,7 @@ const refreshConversations = async () => {
       messages.value = [];
     }
   } catch (err: any) {
-    errorMessage.value = err.message || "加载对话失败";
+    errorMessage.value = err.message || "加载会话失败";
   }
 };
 
@@ -257,7 +274,7 @@ const createConversation = async () => {
     selectedConversationId.value = data.conversation_id;
     await loadConversationDetail(data.conversation_id);
   } catch (err: any) {
-    errorMessage.value = err.message || "创建对话失败";
+    errorMessage.value = err.message || "创建会话失败";
   }
 };
 
@@ -283,42 +300,88 @@ const loadConversationDetail = async (convId: number) => {
       similarityThreshold: Number(data.similarity_threshold ?? 0.2),
       showCitations: Boolean(data.show_citations),
     };
+    await scrollToBottom();
   } catch (err: any) {
-    errorMessage.value = err.message || "加载对话详情失败";
+    errorMessage.value = err.message || "加载会话详情失败";
   }
 };
 
 const sendMessage = async () => {
   errorMessage.value = "";
   if (!selectedConversationId.value) {
-    errorMessage.value = "请先选择对话";
+    errorMessage.value = "请先选择会话";
     return;
   }
-  if (!draftMessage.value.trim()) {
+  const content = draftMessage.value.trim();
+  if (!content) {
     errorMessage.value = "消息不能为空";
     return;
   }
+  if (isSending.value) return;
+
+  isSending.value = true;
+  draftMessage.value = "";
+
+  const now = new Date().toISOString();
+  const tempUserId = Date.now();
+  const tempAssistantId = tempUserId + 1;
+
+  messages.value.push({
+    id: tempUserId,
+    role: "user",
+    content,
+    created_at: now,
+  });
+  messages.value.push({
+    id: tempAssistantId,
+    role: "assistant",
+    content: "正在生成回复...",
+    created_at: now,
+    pending: true,
+  });
+  await scrollToBottom();
+
   try {
-    await request(`/conversations/${selectedConversationId.value}/messages`, {
+    const data = await request(`/conversations/${selectedConversationId.value}/messages`, {
       method: "POST",
       body: JSON.stringify({
         role: "student",
         user_id: auth?.id,
-        content: draftMessage.value.trim(),
+        content,
       }),
     });
-    draftMessage.value = "";
-    await loadConversationDetail(selectedConversationId.value);
+
+    const idx = messages.value.findIndex((msg) => msg.id === tempAssistantId);
+    if (idx >= 0) {
+      messages.value[idx] = {
+        ...messages.value[idx],
+        id: data.assistant_message_id || tempAssistantId,
+        content: data.assistant_answer || "（无回复内容）",
+        pending: false,
+      };
+    }
     await refreshConversations();
+    await loadConversationDetail(selectedConversationId.value);
   } catch (err: any) {
+    const idx = messages.value.findIndex((msg) => msg.id === tempAssistantId);
+    if (idx >= 0) {
+      messages.value[idx] = {
+        ...messages.value[idx],
+        content: "请求失败，请重试。",
+        pending: false,
+      };
+    }
     errorMessage.value = err.message || "发送失败";
+  } finally {
+    isSending.value = false;
+    await scrollToBottom();
   }
 };
 
 const renameConversation = async () => {
   errorMessage.value = "";
   if (!selectedConversationId.value) {
-    errorMessage.value = "请先选择对话";
+    errorMessage.value = "请先选择会话";
     return;
   }
   if (!renameValue.value.trim()) {
@@ -345,7 +408,7 @@ const renameConversation = async () => {
 const clearConversation = async () => {
   errorMessage.value = "";
   if (!selectedConversationId.value) {
-    errorMessage.value = "请先选择对话";
+    errorMessage.value = "请先选择会话";
     return;
   }
   try {
@@ -367,7 +430,7 @@ const clearConversation = async () => {
 const deleteConversation = async () => {
   errorMessage.value = "";
   if (!selectedConversationId.value) {
-    errorMessage.value = "请先选择对话";
+    errorMessage.value = "请先选择会话";
     return;
   }
   try {
@@ -390,7 +453,7 @@ const deleteConversation = async () => {
 const updateSettings = async () => {
   errorMessage.value = "";
   if (!selectedConversationId.value) {
-    errorMessage.value = "请先选择对话";
+    errorMessage.value = "请先选择会话";
     return;
   }
   try {
