@@ -39,6 +39,15 @@
           <option value="student">学生</option>
         </select>
       </div>
+      <div v-if="section === 'users' && userTab === 'student'" class="control">
+        <label>按班级筛选</label>
+        <select v-model="studentClassFilter">
+          <option value="">全部班级</option>
+          <option v-for="cls in classOptions" :key="cls.class_code" :value="cls.class_code">
+            {{ cls.class_code }} - {{ cls.class_name }}
+          </option>
+        </select>
+      </div>
       <button class="btn primary" @click="loadData">刷新列表</button>
       <span class="tip" v-if="errorMessage">{{ errorMessage }}</span>
     </section>
@@ -49,7 +58,7 @@
         <div class="panel-header">
           <div>
             <h2>{{ tab === "pending" ? "待审核文件" : "审核记录" }}</h2>
-            <p class="muted">点击一条记录查看详情与文件预览。</p>
+            <p class="muted">点击记录查看详情与文件预览。</p>
           </div>
         </div>
 
@@ -110,25 +119,17 @@
             >
               下载
             </a>
-            <button
-              v-if="tab === 'pending'"
-              class="btn primary"
-              @click="submitDecision('approved')"
-            >
+            <button v-if="tab === 'pending'" class="btn primary" @click="submitDecision('approved')">
               审核通过
             </button>
-            <button
-              v-if="tab === 'pending'"
-              class="btn danger"
-              @click="submitDecision('rejected')"
-            >
+            <button v-if="tab === 'pending'" class="btn danger" @click="submitDecision('rejected')">
               审核拒绝
             </button>
           </div>
 
           <div v-if="tab === 'pending'" class="form-row">
-            <label>审核意见（可选）</label>
-            <textarea v-model="decisionReason" placeholder="请输入审核说明"></textarea>
+            <label>审核说明（可选）</label>
+            <textarea v-model="decisionReason" placeholder="请输入审核说明（可选）"></textarea>
           </div>
         </div>
       </div>
@@ -299,6 +300,17 @@
             <label>Embedding 模型</label>
             <input v-model="classForm.embedding_model" placeholder="如 BAAI/bge-large-zh-v1.5@BAAI" />
           </div>
+          <div class="form-row">
+            <label>描述（可选）</label>
+            <input v-model="classForm.description" placeholder="如：本班级知识库" />
+          </div>
+          <div class="form-row">
+            <label>切片方式（可选）</label>
+            <select v-model="classForm.chunk_method">
+              <option value="table">table</option>
+              <option value="paragraph">paragraph</option>
+            </select>
+          </div>
           <div class="detail-actions">
             <button class="btn primary" @click="saveClass">保存</button>
             <button class="btn light" @click="resetClassForm">清空</button>
@@ -313,14 +325,34 @@
       <div class="panel-header">
         <div>
           <h2>文件管理</h2>
-          <p class="muted">按班级编号查询文件列表。</p>
+          <p class="muted">按班级查询文件，支持上传/重命名/删除/查找。</p>
         </div>
       </div>
+
       <div class="form-row">
         <label>班级编号</label>
-        <input v-model="fileClassCode" placeholder="如 2502" />
+        <select v-model="fileClassCode">
+          <option value="">请选择班级</option>
+          <option v-for="cls in classOptions" :key="cls.class_code" :value="cls.class_code">
+            {{ cls.class_code }} - {{ cls.class_name }}
+          </option>
+        </select>
       </div>
-      <button class="btn primary" @click="loadFiles">查询文件</button>
+      <div class="form-row">
+        <label>文件名搜索</label>
+        <input v-model="fileKeyword" placeholder="输入文件名关键词" />
+      </div>
+      <div class="detail-actions">
+        <button class="btn primary" @click="loadFiles">查询文件</button>
+      </div>
+
+      <div class="form-row">
+        <label>上传文件（Excel）</label>
+        <input type="file" accept=".xlsx,.xls" @change="onFileChange" />
+      </div>
+      <div class="detail-actions">
+        <button class="btn light" @click="uploadFile">上传到班级知识库</button>
+      </div>
 
       <div v-if="fileRows.length" class="table">
         <div class="table-row table-head">
@@ -329,31 +361,35 @@
           <span>状态</span>
           <span>操作</span>
         </div>
-        <div v-for="row in fileRows" :key="row.document_id" class="table-row table-item">
+        <button
+          v-for="row in fileRows"
+          :key="row.document_id"
+          class="table-row table-item"
+          :class="{ active: row.document_id === selectedFileId }"
+          @click="selectFile(row)"
+        >
           <span>{{ row.document_name }}</span>
           <span>{{ row.class_name }}</span>
           <span>{{ row.status }}</span>
           <span class="file-actions">
-            <a
-              class="btn light"
-              :href="previewUrl(row.document_id)"
-              target="_blank"
-              rel="noreferrer"
-            >
-              预览
-            </a>
-            <a
-              class="btn light"
-              :href="downloadUrl(row.document_id)"
-              target="_blank"
-              rel="noreferrer"
-            >
-              下载
-            </a>
+            <a class="btn light" :href="previewUrl(row.document_id)" target="_blank" rel="noreferrer">预览</a>
+            <a class="btn light" :href="downloadUrl(row.document_id)" target="_blank" rel="noreferrer">下载</a>
           </span>
-        </div>
+        </button>
       </div>
       <div v-else class="empty">暂无文件数据</div>
+
+      <div v-if="selectedFile" class="detail">
+        <div class="detail-row"><span>当前文件</span><strong>{{ selectedFile.document_name }}</strong></div>
+        <div class="form-row">
+          <label>新文件名</label>
+          <input v-model="fileRename" placeholder="如：新文件名.xlsx" />
+        </div>
+        <div class="detail-actions">
+          <button class="btn primary" @click="renameFile">重命名</button>
+          <button class="btn danger" @click="deleteFile">删除</button>
+        </div>
+      </div>
     </section>
   </div>
 </template>
@@ -384,6 +420,8 @@ const decisionReason = ref("");
 const teacherRows = ref<any[]>([]);
 const studentRows = ref<any[]>([]);
 const selectedUserId = ref<number | null>(null);
+const classOptions = ref<any[]>([]);
+const studentClassFilter = ref("");
 const teacherForm = ref({
   id: null as number | null,
   teacher_no: "",
@@ -410,10 +448,17 @@ const classForm = ref({
   class_name: "",
   teacher_no: "",
   embedding_model: "",
+  description: "",
+  chunk_method: "table",
 });
 
 const fileClassCode = ref("");
 const fileRows = ref<any[]>([]);
+const fileKeyword = ref("");
+const selectedFileId = ref<number | null>(null);
+const selectedFile = ref<any | null>(null);
+const fileRename = ref("");
+const fileToUpload = ref<File | null>(null);
 
 const adminId = computed(() => auth?.id || 0);
 const apiBase = getApiBase();
@@ -488,6 +533,9 @@ const loadTeachers = async () => {
 
 const loadStudents = async () => {
   const params = new URLSearchParams({ admin_id: String(adminId.value) });
+  if (studentClassFilter.value) {
+    params.set("class_code", studentClassFilter.value);
+  }
   const data = await request<any[]>(`/admin/students?${params.toString()}`);
   studentRows.value = (data || []).map((s) => ({
     id: s.id,
@@ -504,6 +552,12 @@ const loadClasses = async () => {
   const params = new URLSearchParams({ admin_id: String(adminId.value) });
   const data = await request<any[]>(`/admin/classes?${params.toString()}`);
   classRows.value = data || [];
+};
+
+const loadClassOptions = async () => {
+  const params = new URLSearchParams({ admin_id: String(adminId.value) });
+  const data = await request<any[]>(`/admin/classes?${params.toString()}`);
+  classOptions.value = data || [];
 };
 
 const loadData = async () => {
@@ -525,6 +579,8 @@ const loadData = async () => {
       }
     } else if (section.value === "classes") {
       await loadClasses();
+    } else if (section.value === "files") {
+      await loadFiles();
     }
   } catch (err: any) {
     errorMessage.value = err.message || "加载失败";
@@ -628,14 +684,6 @@ const resetStudentForm = () => {
 };
 
 const saveTeacher = async () => {
-  const payload: any = {
-    admin_id: adminId.value,
-    teacher_no: teacherForm.value.teacher_no,
-    name: teacherForm.value.name,
-    password: teacherForm.value.password,
-    email: teacherForm.value.email || undefined,
-    status: teacherForm.value.status,
-  };
   try {
     if (teacherForm.value.id) {
       await request(`/admin/teachers/${teacherForm.value.id}`, {
@@ -651,7 +699,14 @@ const saveTeacher = async () => {
     } else {
       await request("/admin/teachers", {
         method: "POST",
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          admin_id: adminId.value,
+          teacher_no: teacherForm.value.teacher_no,
+          name: teacherForm.value.name,
+          password: teacherForm.value.password,
+          email: teacherForm.value.email || undefined,
+          status: teacherForm.value.status,
+        }),
       });
     }
     resetTeacherForm();
@@ -732,6 +787,8 @@ const selectClass = (row: any) => {
     class_name: row.class_name,
     teacher_no: row.teacher_no,
     embedding_model: "",
+    description: "",
+    chunk_method: "table",
   };
 };
 
@@ -743,6 +800,8 @@ const resetClassForm = () => {
     class_name: "",
     teacher_no: "",
     embedding_model: "",
+    description: "",
+    chunk_method: "table",
   };
 };
 
@@ -766,11 +825,14 @@ const saveClass = async () => {
           class_name: classForm.value.class_name,
           teacher_no: classForm.value.teacher_no,
           embedding_model: classForm.value.embedding_model,
+          description: classForm.value.description || undefined,
+          chunk_method: classForm.value.chunk_method || undefined,
         }),
       });
     }
     resetClassForm();
     await loadClasses();
+    await loadClassOptions();
   } catch (err: any) {
     errorMessage.value = err.message || "保存失败";
   }
@@ -785,6 +847,7 @@ const deleteClass = async () => {
     });
     resetClassForm();
     await loadClasses();
+    await loadClassOptions();
   } catch (err: any) {
     errorMessage.value = err.message || "删除失败";
   }
@@ -793,8 +856,11 @@ const deleteClass = async () => {
 const loadFiles = async () => {
   errorMessage.value = "";
   fileRows.value = [];
+  selectedFileId.value = null;
+  selectedFile.value = null;
+  fileRename.value = "";
   if (!fileClassCode.value.trim()) {
-    errorMessage.value = "请先填写班级编号";
+    errorMessage.value = "请先选择班级";
     return;
   }
   const params = new URLSearchParams({
@@ -804,11 +870,97 @@ const loadFiles = async () => {
     page: "1",
     page_size: "50",
   });
+  if (fileKeyword.value.trim()) {
+    params.set("filename", fileKeyword.value.trim());
+  }
   try {
     const data = await request<any>(`/documents?${params.toString()}`);
     fileRows.value = data.items || [];
   } catch (err: any) {
     errorMessage.value = err.message || "查询文件失败";
+  }
+};
+
+const onFileChange = (event: Event) => {
+  const input = event.target as HTMLInputElement;
+  fileToUpload.value = input.files?.[0] || null;
+};
+
+const selectFile = (row: any) => {
+  selectedFileId.value = row.document_id;
+  selectedFile.value = row;
+  fileRename.value = row.document_name || "";
+};
+
+const uploadFile = async () => {
+  errorMessage.value = "";
+  if (!fileClassCode.value.trim()) {
+    errorMessage.value = "请先选择班级";
+    return;
+  }
+  if (!fileToUpload.value) {
+    errorMessage.value = "请选择要上传的文件";
+    return;
+  }
+  const form = new FormData();
+  form.append("role", "admin");
+  form.append("uploader_id", String(adminId.value));
+  form.append("class_code", fileClassCode.value.trim());
+  form.append("file", fileToUpload.value);
+  try {
+    const resp = await fetch(`${apiBase}/documents/upload`, {
+      method: "POST",
+      body: form,
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({}));
+      throw new Error(data.detail || `文件上传失败: ${resp.status}`);
+    }
+    fileToUpload.value = null;
+    await loadFiles();
+  } catch (err: any) {
+    errorMessage.value = err.message || "文件上传失败";
+  }
+};
+
+const renameFile = async () => {
+  if (!selectedFile.value) return;
+  const newName = (fileRename.value || "").trim();
+  if (!newName) {
+    errorMessage.value = "请输入新文件名";
+    return;
+  }
+  try {
+    await request(`/documents/${selectedFile.value.document_id}/rename`, {
+      method: "PUT",
+      body: JSON.stringify({
+        role: "admin",
+        user_id: adminId.value,
+        new_name: newName,
+        sync_ragflow: true,
+      }),
+    });
+    await loadFiles();
+  } catch (err: any) {
+    errorMessage.value = err.message || "重命名失败";
+  }
+};
+
+const deleteFile = async () => {
+  if (!selectedFile.value) return;
+  try {
+    await request(`/documents/${selectedFile.value.document_id}`, {
+      method: "DELETE",
+      body: JSON.stringify({
+        role: "admin",
+        user_id: adminId.value,
+        sync_ragflow: true,
+        remove_minio: true,
+      }),
+    });
+    await loadFiles();
+  } catch (err: any) {
+    errorMessage.value = err.message || "删除失败";
   }
 };
 
@@ -828,5 +980,12 @@ watch(userTab, () => {
   }
 });
 
+watch(studentClassFilter, () => {
+  if (section.value === "users" && userTab.value === "student") {
+    loadStudents();
+  }
+});
+
 onMounted(loadData);
+onMounted(loadClassOptions);
 </script>
